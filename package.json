@@ -1,0 +1,27 @@
+{
+  "name": "achivator_bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "standalone.mjs",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Dmitrii Rozhkov",
+  "license": "LGPL-3.0",
+  "dependencies": {
+    "dotenv": "^16.0.3",
+    "mongodb": "^5.5.0",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "eslint": "^8.43.0",
+    "eslint-config-prettier": "^8.8.0",
+    "eslint-plugin-import": "^2.27.5",
+    "eslint-plugin-n": "^16.0.1",
+    "eslint-plugin-prettier": "^4.2.1",
+    "eslint-plugin-promise": "^6.1.1",
+    "prettier": "^2.8.8"
+  }
+}
