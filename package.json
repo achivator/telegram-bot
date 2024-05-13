@@ -5,6 +5,7 @@
   "main": "standalone.mjs",
   "type": "module",
   "scripts": {
+    "start": "node standalone.mjs",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
