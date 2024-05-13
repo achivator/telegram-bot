@@ -1,0 +1,19 @@
+name: Deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cloning repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Dokku
+        uses: dokku/github-action@v1.4.0
+        with:
+          branch: main
+          git_push_flags: "--force"
+          git_remote_url: "ssh://dokku@dokku.seniorsoftwarevlogger.com:22/achivator-bot"
+          ssh_private_key: ${{ secrets.DOKKU_PRIVATE_KEY }}
