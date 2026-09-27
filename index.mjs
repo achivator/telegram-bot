@@ -195,6 +195,11 @@ export default function createBot(database, token, options) {
     }
   }
 
+  // Undoes a takeBudget whose reaction ended up unpaid.
+  function returnBudget(id, amount) {
+    return reactionBudget.updateOne({_id: id}, {$inc: {used: -amount}});
+  }
+
   // Positive reactions on a member's message become points. Points for the
   // chat creator's messages are multiplied (CREATOR_MULTIPLIER) so a creator's
   // activity funds the pool faster. Self-reactions never count.
@@ -244,12 +249,17 @@ export default function createBot(database, token, options) {
         const isCreatorMessage = config.creator !== null && receiver.user_id === config.creator;
         const points = isCreatorMessage ? CREATOR_MULTIPLIER : 1;
         const day = utcDay();
+        const pairBudget = `pair:${chat_id}:${reactor_id}:${receiver.user_id}:${day}`;
+        const receiverBudget = `recv:${chat_id}:${receiver.user_id}:${day}`;
+        // Both budgets are taken before paying; a reaction that ends up unpaid
+        // gives back what it took, so a cap on one side never eats the other.
         for (const emoji of positiveAdd) {
-          if (!(await takeBudget(`pair:${chat_id}:${reactor_id}:${receiver.user_id}:${day}`, 1, PAIR_DAILY_CAP))) {
+          if (!(await takeBudget(pairBudget, 1, PAIR_DAILY_CAP))) {
             noReward(`daily cap: ${PAIR_DAILY_CAP} paid reactions from this reactor to ${receiver.user_id} today`);
             break;
           }
-          if (!(await takeBudget(`recv:${chat_id}:${receiver.user_id}:${day}`, points, RECEIVER_DAILY_CAP))) {
+          if (!(await takeBudget(receiverBudget, points, RECEIVER_DAILY_CAP))) {
+            await returnBudget(pairBudget, 1);
             noReward(`daily cap: ${receiver.user_id} earned ${RECEIVER_DAILY_CAP} reaction points today`);
             break;
           }
@@ -258,6 +268,8 @@ export default function createBot(database, token, options) {
             delta += points;
           } catch (error) {
             if (error?.code !== 11000) throw error;
+            await returnBudget(pairBudget, 1);
+            await returnBudget(receiverBudget, points);
             noReward(`${emoji} already paid (redelivered update)`);
           }
         }
