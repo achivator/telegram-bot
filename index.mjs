@@ -198,15 +198,26 @@ export default function createBot(database, token, options) {
   // Positive reactions on a member's message become points. Points for the
   // chat creator's messages are multiplied (CREATOR_MULTIPLIER) so a creator's
   // activity funds the pool faster. Self-reactions never count.
+  // Every positive reaction logs its outcome: either the points it moved or
+  // why it moved none, so "I reacted and nothing happened" is one log line.
   async function accrueReactionRewards(ctx, reactionsToAdd, reactionsToRemove, receiver) {
     const positiveAdd = reactionsToAdd.filter(reaction => POSITIVE_REACTIONS.has(normalizeEmoji(reaction)));
     const positiveRemove = reactionsToRemove.filter(reaction => POSITIVE_REACTIONS.has(normalizeEmoji(reaction)));
-    if (positiveAdd.length === 0 && positiveRemove.length === 0) return;
-    if (!receiver) return;
-    if (receiver.user_id === ctx.from.id) return;
-
     const chat_id = ctx.chat.id;
     const reactor_id = ctx.from.id;
+    const noReward = reason =>
+      console.log(`no reward: ${reason} (chat ${chat_id}, message ${receiver?.message_id}, from ${reactor_id})`);
+
+    if (positiveAdd.length === 0 && positiveRemove.length === 0) {
+      if (reactionsToAdd.length > 0) noReward(`not a positive reaction: ${reactionsToAdd.join(" ")}`);
+      return;
+    }
+    if (!receiver) return;
+    if (receiver.user_id === reactor_id) {
+      noReward("self-reaction");
+      return;
+    }
+
     const key = {chat_id, message_id: receiver.message_id, reactor_id};
     let delta = 0;
 
@@ -216,6 +227,7 @@ export default function createBot(database, token, options) {
       const record = paid?.value !== undefined ? paid.value : paid; // driver v4 vs v5 result shape
       if (record?.points) delta -= record.points;
     }
+    if (positiveRemove.length > 0 && delta === 0) noReward(`removed ${positiveRemove.join(" ")} had not been paid`);
 
     if (positiveAdd.length > 0) {
       const config = await getChatRewardConfig(chat_id);
@@ -224,18 +236,29 @@ export default function createBot(database, token, options) {
       const written = config.jetton_master
         ? await messages.countDocuments({chat_id, user_id: reactor_id}, {limit: MIN_REACTOR_MESSAGES})
         : 0;
-      if (config.jetton_master && written >= MIN_REACTOR_MESSAGES) {
+      if (!config.jetton_master) {
+        noReward("no reward jetton in this chat, the creator runs /jetton <master address>");
+      } else if (written < MIN_REACTOR_MESSAGES) {
+        noReward(`reactor has ${written}/${MIN_REACTOR_MESSAGES} messages in the chat`);
+      } else {
         const isCreatorMessage = config.creator !== null && receiver.user_id === config.creator;
         const points = isCreatorMessage ? CREATOR_MULTIPLIER : 1;
         const day = utcDay();
         for (const emoji of positiveAdd) {
-          if (!(await takeBudget(`pair:${chat_id}:${reactor_id}:${receiver.user_id}:${day}`, 1, PAIR_DAILY_CAP))) break;
-          if (!(await takeBudget(`recv:${chat_id}:${receiver.user_id}:${day}`, points, RECEIVER_DAILY_CAP))) break;
+          if (!(await takeBudget(`pair:${chat_id}:${reactor_id}:${receiver.user_id}:${day}`, 1, PAIR_DAILY_CAP))) {
+            noReward(`daily cap: ${PAIR_DAILY_CAP} paid reactions from this reactor to ${receiver.user_id} today`);
+            break;
+          }
+          if (!(await takeBudget(`recv:${chat_id}:${receiver.user_id}:${day}`, points, RECEIVER_DAILY_CAP))) {
+            noReward(`daily cap: ${receiver.user_id} earned ${RECEIVER_DAILY_CAP} reaction points today`);
+            break;
+          }
           try {
             await reactionPoints.insertOne({...key, emoji: normalizeEmoji(emoji), receiver_id: receiver.user_id, points, date: new Date()});
             delta += points;
           } catch (error) {
-            if (error?.code !== 11000) throw error; // redelivered update: already paid
+            if (error?.code !== 11000) throw error;
+            noReward(`${emoji} already paid (redelivered update)`);
           }
         }
       }
@@ -624,7 +647,15 @@ You can find the source code at https://github.com/seniorsoftwarevlogger/achivat
 
     const receiver = await messages.findOne({chat_id, message_id});
     console.log({chat_id, message_id, receiver});
-    if (!receiver) return next(); // written before the bot could see it, or by a bot
+    if (!receiver) {
+      // written before the bot recorded it (before it was an admin, while it
+      // was down, a non-text message before rewards shipped), by a bot, or on
+      // behalf of a channel: Telegram does not say who wrote it
+      if (reactionsToAdd.some(emoji => POSITIVE_REACTIONS.has(emoji))) {
+        console.log(`no reward: unknown author of message ${message_id} (chat ${chat_id}, from ${ctx.from.id})`);
+      }
+      return next();
+    }
 
     const author = await countReactions(chat_id, receiver.user_id, "reactionsReceived", reactionsToAdd, reactionsToRemove);
 

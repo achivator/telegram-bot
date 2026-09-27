@@ -50,6 +50,12 @@ class Coll {
 const cols = new Map();
 const database = {collection: name => (cols.has(name) ? cols.get(name) : cols.set(name, new Coll()).get(name))};
 
+// the bot explains every unpaid positive reaction in the log
+const logs = [];
+const originalLog = console.log;
+console.log = (...args) => { if (typeof args[0] === "string") logs.push(args[0]); };
+const lastNoReward = () => logs.filter(line => line.startsWith("no reward:")).at(-1);
+
 const {default: createBot} = await import("../index.mjs");
 const bot = createBot(database, "1:x");
 bot.botInfo = {id: 999, is_bot: true, username: "achivator_bot", first_name: "A"};
@@ -88,6 +94,7 @@ assert.equal(cols.get("messages").docs.length, 4);
 const photo = await send(user(AUTHOR), {photo: [{file_id: "x"}]});
 await react(user(REACTOR), photo, [], ["👍"]);
 assert.equal(points(AUTHOR), 0, "reactor below 5 messages must not pay");
+assert.match(lastNoReward(), /reactor has 4\/5 messages/);
 await react(user(REACTOR), photo, ["👍"], []);
 
 await send(user(REACTOR), {text: "fifth"});
@@ -97,11 +104,17 @@ await react(user(REACTOR), photo, ["👍"], ["👍", "❤‍🔥", {type: "paid"
 assert.equal(points(AUTHOR), 2, "❤‍🔥 pays, paid star is ignored");
 await react(user(REACTOR), photo, ["👍", "❤‍🔥"], ["❤‍🔥"]);
 assert.equal(points(AUTHOR), 1, "removing 👍 takes its point back");
+await react(user(REACTOR), photo, [], ["🤡"]);
+assert.match(lastNoReward(), /not a positive reaction: 🤡/);
+await react(user(REACTOR), photo, ["🤡"], []);
 
 // Self-reactions and newcomers never pay.
 const own = await send(user(REACTOR), {text: "own"});
 await react(user(REACTOR), own, [], ["🔥"]);
 assert.equal(points(REACTOR), 0);
+assert.match(lastNoReward(), /self-reaction/);
+await react(user(REACTOR), 424242, [], ["🔥"]);
+assert.match(lastNoReward(), /unknown author of message 424242/);
 await send(user(NEWCOMER), {text: "hello"});
 await react(user(NEWCOMER), photo, [], ["🔥"]);
 assert.equal(points(AUTHOR), 1);
@@ -129,10 +142,27 @@ assert.ok(!achievementsOf(AUTHOR).includes("newbie"));
 await send(user(AUTHOR), {text: "tenth"});
 assert.ok(achievementsOf(AUTHOR).includes("newbie"));
 
+// Pair cap: one reactor pays one receiver PAIR_DAILY_CAP (5) reactions a day.
+for (let i = 0; i < 6; i++) {
+  const m = await send(user(AUTHOR), {text: `cap${i}`});
+  await react(user(REACTOR), m, [], ["🔥"]);
+}
+assert.match(lastNoReward(), /daily cap: 5 paid reactions from this reactor/);
+
+// No jetton configured: nothing pays, and the log says why.
+const OTHER = {id: -200, type: "supergroup", title: "O"};
+for (let i = 0; i < 5; i++) {
+  await bot.handleUpdate({update_id: ++updateId, message: {message_id: 9000 + i, date: 1, chat: OTHER, from: user(REACTOR), text: "x"}});
+}
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: 9100, date: 1, chat: OTHER, from: user(AUTHOR), text: "y"}});
+await bot.handleUpdate({update_id: ++updateId, message_reaction: {chat: OTHER, message_id: 9100, user: user(REACTOR), date: 1, old_reaction: [], new_reaction: [{type: "emoji", emoji: "👍"}]}});
+assert.match(lastNoReward(), /no reward jetton in this chat/);
+
 // Redelivered message update is recorded once.
 await bot.handleUpdate({update_id: ++updateId, message: {message_id: photo, date: 1, chat: CHAT, from: user(AUTHOR), photo: []}});
 assert.equal(cols.get("messages").docs.filter(d => d.message_id === photo).length, 1);
 
+console.log = originalLog;
 console.log("ALL OK");
 // pending achievement clean-up timers would keep the process alive for 30 s
 process.exit(0);
