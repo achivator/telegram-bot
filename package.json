@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node standalone.mjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/rewards.test.mjs"
   },
   "keywords": [],
   "author": "Dmitrii Rozhkov",

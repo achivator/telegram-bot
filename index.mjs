@@ -21,60 +21,93 @@ function postMetric(body) {
   }).catch(error => console.error("metric push failed:", error.message));
 }
 
-function incrementStat(collection, chat_id, user_id, item_id, type) {
+// Returns the statistics document after the increment, so thresholds can be
+// checked against the value this very update produced.
+async function incrementStat(collection, chat_id, user_id, type) {
   postMetric(`messages,chat_id=${chat_id},user_id=${user_id},type=${type} value=1`);
 
-  return collection.updateOne({chat_id, user_id}, {$inc: {[type]: 1}}, {upsert: true});
+  const result = await collection.findOneAndUpdate(
+    {chat_id, user_id},
+    {$inc: {[type]: 1}},
+    {upsert: true, returnDocument: "after"},
+  );
+  return unwrapModifyResult(result);
+}
+
+// Driver v5 wraps findOneAnd* results in {value}; v6 returns the document.
+function unwrapModifyResult(result) {
+  return result?.value !== undefined ? result.value : result;
+}
+
+// Telegram sends ❤ without the U+FE0F variation selector, clients often type
+// it with one; compare and store emoji without it.
+function normalizeEmoji(emoji) {
+  return String(emoji).replace(/\uFE0F/g, "");
 }
 
 function mentionUser(user) {
-  return mention(user.first_name, user);
+  return mention(user.first_name || user.username || "member", user);
 }
 
-async function giveAchievement(ctx, dbCollection, achievement) {
-  const chat_id = ctx.chat.id;
-  const user_id = ctx.from.id;
+// Awards `achievement` to `user` (the sender of the update by default) once per
+// chat. Called fire-and-forget from update handlers, so it must never reject:
+// an unhandled rejection terminates Node.
+async function giveAchievement(ctx, dbCollection, achievement, {user = ctx.from, message_id} = {}) {
+  try {
+    const chat_id = ctx.chat.id;
+    const user_id = user.id;
 
-  const existingAchievement = await dbCollection.findOne({
-    chat_id,
-    user_id,
-    type: achievement,
-    collection: NFT_COLLECTION,
-  });
+    const existingAchievement = await dbCollection.findOne({
+      chat_id,
+      user_id,
+      type: achievement,
+      collection: NFT_COLLECTION,
+    });
 
-  if (existingAchievement) return;
+    if (existingAchievement) return;
 
-  const message_id = ctx.message?.message_id || ctx.message_reaction?.message_id;
-
-  await dbCollection.insertOne(
-    {
+    await dbCollection.insertOne({
       chat_id,
       user_id,
       type: achievement,
       date: Date.now(),
-      message_id,
+      message_id: message_id ?? ctx.message?.message_id ?? ctx.messageReaction?.message_id,
       collection: NFT_COLLECTION,
-    },
-    {upsert: true},
-  );
+    });
 
-  console.log(`User ${ctx.from.id} got achievement ${achievement} in chat ${ctx.chat.id}`);
+    console.log(`User ${user_id} got achievement ${achievement} in chat ${chat_id}`);
 
-  ctx
-    .sendMessage(
-      fmt`Hey, ${mentionUser(ctx.from)}! New achievement unlocked: ${bold(achievement)}! Check it out in ${link(
-        "the mini app",
-        "https://t.me/achivator_bot/app",
-      )} by @achivator_bot 🎉`,
-    )
-    .then(botReply => setTimeout(() => ctx.deleteMessage(botReply.message_id).catch(console.error), 30000));
+    ctx
+      .sendMessage(
+        fmt`Hey, ${mentionUser(user)}! New achievement unlocked: ${bold(achievement)}! Check it out in ${link(
+          "the mini app",
+          "https://t.me/achivator_bot/app",
+        )} by @achivator_bot 🎉`,
+      )
+      .then(botReply => setTimeout(() => ctx.deleteMessage(botReply.message_id).catch(console.error), 30000))
+      .catch(console.error);
 
-  // ctx.telegram
-  //   .sendMessage(ctx.from.id, fmt`New achievement: ${bold(achievement)} in ${ctx.chat.title}!`)
-  //   .catch(console.error);
+    // Send grafana metric to count achievements
+    postMetric(`achievements,chat_id=${chat_id},user_id=${user_id},type=${achievement} value=1`);
+  } catch (error) {
+    console.error(`achievement ${achievement} failed:`, error);
+  }
+}
 
-  // Send grafana metric to count achievements
-  postMetric(`achievements,chat_id=${chat_id},user_id=${user_id},type=${achievement} value=1`);
+// True when a counter that just grew by `added` to `after` passed `threshold`.
+// Reactions are counted several at a time, so an exact `=== 100` can be skipped.
+function crossed(after, added, threshold) {
+  return added > 0 && (after || 0) >= threshold && (after || 0) - added < threshold;
+}
+
+function isGroup(ctx) {
+  return ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+}
+
+// Only people's messages in groups count: bots, anonymous admins and posts sent
+// on behalf of a channel (both arrive from a bot account) have nobody to reward.
+function isMemberMessage(ctx) {
+  return Boolean(ctx.from) && !ctx.from.is_bot && isGroup(ctx);
 }
 
 export default function createBot(database, token, options) {
@@ -92,17 +125,16 @@ export default function createBot(database, token, options) {
   // jetton master (/jetton). The miniapp converts points into claimable
   // jetton amounts; the bot only accrues points.
 
+  // Emoji as Telegram sends them in ReactionTypeEmoji, without U+FE0F. Paid
+  // (⭐) and custom emoji reactions are other reaction types and never count.
   const POSITIVE_REACTIONS = new Set([
-    "👍", "❤", "🔥", "🎉", "😍", "🥰", "👏", "💯", "⭐", "🤩", "😁", "🙏", "🤝", "🏆",
+    "👍", "❤", "🔥", "❤‍🔥", "🎉", "😍", "🥰", "👏", "💯", "🤩", "😁", "🤣", "🙏", "🤝", "🏆",
+    "👌", "⚡", "🫡", "😎", "🤗", "😇", "💘", "🍾", "🆒",
   ]);
   const CREATOR_MULTIPLIER = Number(process.env.CREATOR_MULTIPLIER || 10);
   const CHAT_CONFIG_TTL_MS = 5 * 60 * 1000;
 
   const chatConfigCache = new Map(); // chat_id -> {value, expiresAt}
-
-  function normalizeEmoji(emoji) {
-    return String(emoji).replace(/\uFE0F/g, "");
-  }
 
   async function getChatRewardConfig(chat_id) {
     const cached = chatConfigCache.get(chat_id);
@@ -138,6 +170,9 @@ export default function createBot(database, token, options) {
   // (claim rules) per receiver; these keep that query indexed.
   reactionPoints.createIndex({chat_id: 1, receiver_id: 1, date: 1}).catch(console.error);
   grants.createIndex({chat_id: 1, user_id: 1, date: 1}).catch(console.error);
+  // who wrote a reacted message, and how many messages a reactor has written
+  messages.createIndex({chat_id: 1, message_id: 1}).catch(console.error);
+  messages.createIndex({chat_id: 1, user_id: 1}).catch(console.error);
   // budgets only matter for the day they count
   reactionBudget.createIndex({created_at: 1}, {expireAfterSeconds: 3 * 86400}).catch(console.error);
 
@@ -184,8 +219,12 @@ export default function createBot(database, token, options) {
 
     if (positiveAdd.length > 0) {
       const config = await getChatRewardConfig(chat_id);
-      const reactor = config.jetton_master ? await statistics.findOne({chat_id, user_id: reactor_id}) : null;
-      if (config.jetton_master && (reactor?.messages || 0) >= MIN_REACTOR_MESSAGES) {
+      // any message type counts: a member who only posts stickers or voice
+      // messages is as real as one who types
+      const written = config.jetton_master
+        ? await messages.countDocuments({chat_id, user_id: reactor_id}, {limit: MIN_REACTOR_MESSAGES})
+        : 0;
+      if (config.jetton_master && written >= MIN_REACTOR_MESSAGES) {
         const isCreatorMessage = config.creator !== null && receiver.user_id === config.creator;
         const points = isCreatorMessage ? CREATOR_MULTIPLIER : 1;
         const day = utcDay();
@@ -519,130 +558,95 @@ You can find the source code at https://github.com/seniorsoftwarevlogger/achivat
 
     // Check if the bot was granted admin rights
     if (status === "administrator") {
-      ctx.reply("Thank you for granting me admin rights! I will now be able to track messages and reactions 🙌");
+      ctx.reply(
+        "Thank you for granting me admin rights! I will now be able to track messages and reactions 🙌\n" +
+          "To reward members with jettons for positive reactions, the chat creator runs /jetton <jetton master address>.",
+      );
     }
 
     next();
   });
 
+  // Counter -> achievement, for reactions given by the reactor and received by
+  // the author of the reacted message.
+  const GIVEN_REACTION_ACHIEVEMENTS = {"🤡": "sad clown", "❤": "spread the love", "👍": "likes for everyone", "🔥": "fire starter", "💩": "poop master"};
+  const RECEIVED_REACTION_ACHIEVEMENTS = {"👍": "liked", "🔥": "on fire", "❤": "loved", "🤡": "clown", "💩": "poop"};
+  const REACTION_ACHIEVEMENT_THRESHOLD = 100;
+
+  async function countReactions(chat_id, user_id, field, added, removed) {
+    const inc = {};
+    for (const emoji of added) inc[`${field}.${emoji}`] = (inc[`${field}.${emoji}`] || 0) + 1;
+    for (const emoji of removed) inc[`${field}.${emoji}`] = (inc[`${field}.${emoji}`] || 0) - 1;
+    if (field === "reactionsGiven") inc.reactions = added.length - removed.length;
+    const result = await statistics.findOneAndUpdate(
+      {chat_id, user_id},
+      {$inc: inc},
+      {upsert: true, returnDocument: "after"},
+    );
+    return unwrapModifyResult(result);
+  }
+
+  // Reactions need the bot to be a chat admin and "message_reaction" in
+  // allowed_updates (standalone.mjs); Telegram sends neither by default.
   telegraf.on("message_reaction", async (ctx, next) => {
     console.log(ctx.update, ctx.from);
-    if (!ctx.from) return; // only handle reactions from users
+    // Anonymous reactions (channels, anonymous admins) come without a user and
+    // only as message_reaction_count: there is nobody to credit or charge.
+    if (!ctx.from) return next();
 
-    // Preparing the reactions to be added and removed
     // We only care about native emoji reactions
-    const newReactions = ctx.update.message_reaction.new_reaction
-      .filter(reaction => reaction.type == "emoji")
-      .map(reaction => reaction.emoji);
-    const oldReactions = ctx.update.message_reaction.old_reaction
-      .filter(reaction => reaction.type == "emoji")
-      .map(reaction => reaction.emoji);
+    const emojiOf = reactions =>
+      reactions.filter(reaction => reaction.type === "emoji").map(reaction => normalizeEmoji(reaction.emoji));
+    const newReactions = emojiOf(ctx.messageReaction.new_reaction);
+    const oldReactions = emojiOf(ctx.messageReaction.old_reaction);
 
-    // If new reactions are not in the old reactions, they are added
     const reactionsToAdd = newReactions.filter(reaction => !oldReactions.includes(reaction));
-
-    // If old reactions are not in the new reactions, they are removed
     const reactionsToRemove = oldReactions.filter(reaction => !newReactions.includes(reaction));
+    if (reactionsToAdd.length === 0 && reactionsToRemove.length === 0) return next();
 
     console.log({reactionsToAdd, reactionsToRemove});
 
+    const chat_id = ctx.chat.id;
+    const message_id = ctx.messageReaction.message_id;
+
     // keep separate reactions count for each chat
-    if (reactionsToAdd.length > 0) {
-      await statistics.updateOne(
-        {chat_id: ctx.chat.id, user_id: ctx.from.id},
-        {
-          $inc: {
-            reactions: reactionsToAdd.length,
-            ...Object.fromEntries(reactionsToAdd.map(reaction => [`reactionsGiven.${reaction}`, 1])),
-          },
-        },
-        {upsert: true},
-      );
+    const reactor = await countReactions(chat_id, ctx.from.id, "reactionsGiven", reactionsToAdd, reactionsToRemove);
+
+    if (crossed(reactor?.reactions, reactionsToAdd.length, REACTION_ACHIEVEMENT_THRESHOLD)) {
+      giveAchievement(ctx, achievements, "reactive", {message_id});
     }
-    if (reactionsToRemove.length > 0) {
-      await statistics.updateOne(
-        {chat_id: ctx.chat.id, user_id: ctx.from.id},
-        {
-          $inc: {
-            reactions: -reactionsToRemove.length,
-            ...Object.fromEntries(reactionsToRemove.map(reaction => [`reactionsGiven.${reaction}`, -1])),
-          },
-        },
-        {upsert: true},
-      );
-    }
-
-    const receiver = await database
-      .collection("messages")
-      .findOne({chat_id: ctx.chat.id, message_id: ctx.update.message_reaction.message_id});
-
-    console.log({chat_id: ctx.chat.id, message_id: ctx.update.message_reaction.message_id, receiver});
-
-    if (receiver) {
-      if (reactionsToAdd.length > 0) {
-        await statistics.updateOne(
-          {chat_id: ctx.chat.id, user_id: receiver.user_id},
-          {$inc: Object.fromEntries(reactionsToAdd.map(reaction => [`reactionsReceived.${reaction}`, 1]))},
-          {upsert: true},
-        );
+    for (const emoji of reactionsToAdd) {
+      const achievement = GIVEN_REACTION_ACHIEVEMENTS[emoji];
+      if (achievement && reactor?.reactionsGiven?.[emoji] === REACTION_ACHIEVEMENT_THRESHOLD) {
+        giveAchievement(ctx, achievements, achievement, {message_id});
       }
-      if (reactionsToRemove.length > 0) {
-        await statistics.updateOne(
-          {chat_id: ctx.chat.id, user_id: receiver.user_id},
-          {$inc: Object.fromEntries(reactionsToRemove.map(reaction => [`reactionsReceived.${reaction}`, -1]))},
-          {upsert: true},
-        );
+    }
+
+    const receiver = await messages.findOne({chat_id, message_id});
+    console.log({chat_id, message_id, receiver});
+    if (!receiver) return next(); // written before the bot could see it, or by a bot
+
+    const author = await countReactions(chat_id, receiver.user_id, "reactionsReceived", reactionsToAdd, reactionsToRemove);
+
+    // Received-reaction achievements belong to the author of the message, not
+    // to whoever happened to react. Self-reactions do not count.
+    if (receiver.user_id !== ctx.from.id) {
+      let authorUser = null;
+      for (const emoji of reactionsToAdd) {
+        const achievement = RECEIVED_REACTION_ACHIEVEMENTS[emoji];
+        if (achievement && author?.reactionsReceived?.[emoji] === REACTION_ACHIEVEMENT_THRESHOLD) {
+          authorUser ??= await ctx
+            .getChatMember(receiver.user_id)
+            .then(member => member.user)
+            .catch(() => ({id: receiver.user_id, first_name: "member"}));
+          giveAchievement(ctx, achievements, achievement, {user: authorUser, message_id});
+        }
       }
-
-      await accrueReactionRewards(ctx, reactionsToAdd, reactionsToRemove, receiver);
     }
 
-    next();
-  });
+    await accrueReactionRewards(ctx, reactionsToAdd, reactionsToRemove, receiver);
 
-  telegraf.on("message_reaction", async (ctx, next) => {
-    const userQuery = {chat_id: ctx.chat.id, user_id: ctx.from.id};
-    // the first message_reaction handler has already upserted this document
-    const chatUser = await statistics.findOne(userQuery);
-    if (!chatUser) return;
-
-    if (chatUser.reactions === 100) {
-      giveAchievement(ctx, achievements, "reactive");
-    }
-
-    // received reactions
-    if (chatUser.reactionsReceived?.["👍"] === 100) {
-      giveAchievement(ctx, achievements, "liked");
-    }
-    if (chatUser.reactionsReceived?.["🔥"] === 100) {
-      giveAchievement(ctx, achievements, "on fire");
-    }
-    if (chatUser.reactionsReceived?.["❤️"] === 100) {
-      giveAchievement(ctx, achievements, "loved");
-    }
-    if (chatUser.reactionsReceived?.["🤡"] === 100) {
-      giveAchievement(ctx, achievements, "clown");
-    }
-    if (chatUser.reactionsReceived?.["💩"] === 100) {
-      giveAchievement(ctx, achievements, "poop");
-    }
-
-    // given reactions
-    if (chatUser.reactionsGiven?.["🤡"] === 100) {
-      giveAchievement(ctx, achievements, "sad clown");
-    }
-    if (chatUser.reactionsGiven?.["❤️"] === 100) {
-      giveAchievement(ctx, achievements, "spread the love");
-    }
-    if (chatUser.reactionsGiven?.["👍"] === 100) {
-      giveAchievement(ctx, achievements, "likes for everyone");
-    }
-    if (chatUser.reactionsGiven?.["🔥"] === 100) {
-      giveAchievement(ctx, achievements, "fire starter");
-    }
-    if (chatUser.reactionsGiven?.["💩"] === 100) {
-      giveAchievement(ctx, achievements, "poop master");
-    }
+    return next();
   });
 
   telegraf.on("message_reaction_count", async (ctx, next) => {
@@ -653,62 +657,70 @@ You can find the source code at https://github.com/seniorsoftwarevlogger/achivat
     next();
   });
 
+  // Content types a member writes; service messages (joins, pins, topic edits)
+  // are not something anyone reacts to or should count as activity.
+  const CONTENT_TYPES = [
+    "text", "photo", "video", "animation", "sticker", "voice", "video_note", "audio", "document",
+    "poll", "dice", "location", "venue", "contact", "story", "paid_media",
+  ];
+
+  // Every member message is recorded, whatever its type: a reaction can only
+  // be paid when the bot knows who wrote the message, and memes, stickers and
+  // voice messages collect reactions just like text.
+  telegraf.on("message", async (ctx, next) => {
+    if (!isMemberMessage(ctx) || !CONTENT_TYPES.some(type => type in ctx.message)) return next();
+
+    // upsert: a redelivered update must not record the message twice
+    await messages.updateOne(
+      {chat_id: ctx.chat.id, message_id: ctx.message.message_id},
+      {$setOnInsert: {user_id: ctx.from.id, date: ctx.message.date}},
+      {upsert: true},
+    );
+    // keep track of all chats
+    await chats.updateOne(
+      {id: ctx.chat.id},
+      {$setOnInsert: {id: ctx.chat.id, title: ctx.chat.title}},
+      {upsert: true},
+    );
+
+    return next();
+  });
+
   telegraf.on(message("video_note"), async (ctx, next) => {
-    console.log("video_note", ctx.update);
-    incrementStat(statistics, ctx.chat.id, ctx.from.id, ctx.message?.message_id, "video_note");
+    if (!isMemberMessage(ctx)) return next();
+    await incrementStat(statistics, ctx.chat.id, ctx.from.id, "video_note");
     giveAchievement(ctx, achievements, "telescope");
 
-    next();
+    return next();
   });
 
   telegraf.on(message("voice"), async (ctx, next) => {
-    console.log("voice", ctx.update);
-    incrementStat(statistics, ctx.chat.id, ctx.from.id, ctx.message?.message_id, "voice");
+    if (!isMemberMessage(ctx)) return next();
+    await incrementStat(statistics, ctx.chat.id, ctx.from.id, "voice");
     giveAchievement(ctx, achievements, "voicy");
 
-    next();
+    return next();
   });
 
   telegraf.on(message("sticker"), async (ctx, next) => {
-    console.log("sticker", ctx.update);
-    incrementStat(statistics, ctx.chat.id, ctx.from.id, ctx.message?.message_id, "sticker");
+    if (!isMemberMessage(ctx)) return next();
+    await incrementStat(statistics, ctx.chat.id, ctx.from.id, "sticker");
     giveAchievement(ctx, achievements, "sticker");
 
-    next();
+    return next();
   });
 
   telegraf.on(message("text"), async (ctx, next) => {
-    if (!ctx.from) return; // only handle messages from users
-    if (ctx.from?.is_bot) return; // Filter out messages sent by the bots
-    if (ctx.chat?.type !== "group" && ctx.chat?.type !== "supergroup") return; // Filter out messages sent to the bot privately
+    if (!isMemberMessage(ctx)) return next();
 
-    console.log(ctx.message);
+    // keep separate messages count for each chat; read back atomically so
+    // concurrent messages cannot both (or neither) see the threshold
+    const chatUser = await incrementStat(statistics, ctx.chat.id, ctx.from.id, "messages");
 
-    // keep track of all messages to award reactions
-    await messages.insertOne({
-      chat_id: ctx.chat.id,
-      user_id: ctx.from.id,
-      message_id: ctx.message.message_id,
-      date: ctx.message.date,
-    });
-    // keep track of all chats
-    if (!(await chats.findOne({id: ctx.chat.id}))) {
-      await chats.insertOne({id: ctx.chat.id, title: ctx.chat.title}, {upsert: true});
-    }
-
-    // keep separate messages count for each chat
-    const userQuery = {chat_id: ctx.chat.id, user_id: ctx.from.id};
-    // insertOne(doc, options) used to receive the defaults as its options and
-    // return an InsertOneResult, so a first message never had `messages`.
-    const chatUser = (await statistics.findOne(userQuery)) || {...userQuery, messages: 0, reactions: 0};
-
-    incrementStat(statistics, ctx.chat.id, ctx.from.id, ctx.message?.message_id, "messages");
-
-    // detect if user reached 100 messages
-    if (chatUser && chatUser.messages === 100) {
+    if (chatUser?.messages === 100) {
       giveAchievement(ctx, achievements, "talkative");
     }
-    if (chatUser && chatUser.messages === 10) {
+    if (chatUser?.messages === 10) {
       giveAchievement(ctx, achievements, "newbie");
     }
 

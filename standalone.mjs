@@ -44,7 +44,18 @@ const botOptions = isProduction
       polling: { timeout: 30, limit: 10 },
     };
 
-bot.launch(botOptions);
+// Telegram leaves reactions out of the default update set: without listing
+// them here the bot never sees a reaction, so it can pay no reaction points.
+// The list is also stored by setWebhook and replaces what was set before.
+const allowedUpdates = [
+  "message",
+  "channel_post",
+  "my_chat_member",
+  "message_reaction",
+  "message_reaction_count",
+];
+
+bot.launch({ ...botOptions, allowedUpdates });
 
 // Enable graceful stop
 process.once("SIGINT", () => bot.stop("SIGINT"));
