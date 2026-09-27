@@ -149,6 +149,27 @@ for (let i = 0; i < 6; i++) {
 }
 assert.match(lastNoReward(), /daily cap: 5 paid reactions from this reactor/);
 
+// A reaction stopped by the receiver's daily cap keeps the pair budget intact,
+// and a redelivered update gives back what it took.
+const day = new Date().toISOString().slice(0, 10);
+const budget = id => cols.get("reaction_budget").docs.find(d => d._id === id)?.used ?? 0;
+const RICH = 5;
+await database.collection("reaction_budget").insertOne({_id: `recv:${CHAT.id}:${RICH}:${day}`, used: 200});
+const rich = await send(user(RICH), {text: "popular"});
+await react(user(REACTOR), rich, [], ["👍"]);
+assert.match(lastNoReward(), /earned 200 reaction points today/);
+assert.equal(budget(`pair:${CHAT.id}:${REACTOR}:${RICH}:${day}`), 0, "receiver cap must not spend the pair budget");
+
+const again = await send(user(NEWCOMER), {text: "again"});
+const redelivered = {update_id: ++updateId, message_reaction: {chat: CHAT, message_id: again, user: user(REACTOR), date: 1,
+  old_reaction: [], new_reaction: [{type: "emoji", emoji: "👍"}]}};
+await bot.handleUpdate(redelivered);
+await bot.handleUpdate(structuredClone(redelivered));
+assert.match(lastNoReward(), /already paid/);
+assert.equal(points(NEWCOMER), 1);
+assert.equal(budget(`pair:${CHAT.id}:${REACTOR}:${NEWCOMER}:${day}`), 1, "a redelivery must not spend the pair budget");
+assert.equal(budget(`recv:${CHAT.id}:${NEWCOMER}:${day}`), 1, "a redelivery must not spend the receiver budget");
+
 // No jetton configured: nothing pays, and the log says why.
 const OTHER = {id: -200, type: "supergroup", title: "O"};
 for (let i = 0; i < 5; i++) {
