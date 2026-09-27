@@ -2,9 +2,10 @@ import dotenv from "dotenv";
 import createBot from "./index.mjs";
 import { MongoClient } from "mongodb";
 
-const isProduction = process.env.NODE_ENV === "production";
-
 dotenv.config();
+
+const isProduction = process.env.NODE_ENV === "production";
+const isTelegramTestEnvironment = process.env.TELEGRAM_TEST_ENV === "true";
 
 const missingEnv = [
   "MONGODB_URI",
@@ -28,6 +29,7 @@ const database = mongo.db("achivator_bot");
 const bot = createBot(database, process.env.ACHIVATOR_TOKEN, {
   telegram: {
     webhookReply: isProduction,
+    testEnv: isTelegramTestEnvironment,
   },
 });
 
