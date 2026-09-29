@@ -4,9 +4,18 @@ import assert from "node:assert/strict";
 import {Telegram} from "telegraf";
 
 const sent = [];
+const commandMenus = [];
+// chat member status by user id ("member" when unset); "error" makes the
+// lookup fail, as it does for an anonymous admin
+const statuses = new Map();
 Telegram.prototype.callApi = async function (method, payload) {
-  if (method === "getChatMember") return {status: "member", user: {id: payload.user_id, first_name: `U${payload.user_id}`}};
+  if (method === "getChatMember") {
+    const status = statuses.get(payload.user_id) ?? "member";
+    if (status === "error") throw new Error("Bad Request: user not found");
+    return {status, user: {id: payload.user_id, first_name: `U${payload.user_id}`}};
+  }
   if (method === "sendMessage") { sent.push(payload); return {message_id: 1}; }
+  if (method === "setMyCommands") commandMenus.push(payload);
   return true;
 };
 
@@ -182,6 +191,161 @@ assert.match(lastNoReward(), /no reward jetton in this chat/);
 // Redelivered message update is recorded once.
 await bot.handleUpdate({update_id: ++updateId, message: {message_id: photo, date: 1, chat: CHAT, from: user(AUTHOR), photo: []}});
 assert.equal(cols.get("messages").docs.filter(d => d.message_id === photo).length, 1);
+
+// ---- Languages ----
+const {t} = await import("../i18n.mjs");
+const settle = () => new Promise(resolve => setTimeout(resolve, 20));
+const lastText = chat_id => sent.filter(m => m.chat_id === chat_id).at(-1)?.text;
+const speaker = (id, language_code) => ({...user(id), language_code});
+const inChat = (chat, from, content) =>
+  bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1, chat, from, ...content}});
+const command = text => ({text, entities: [{type: "bot_command", offset: 0, length: text.split(" ")[0].length}]});
+
+// Command menus: English by default and Russian, both with /lang.
+assert.deepEqual(commandMenus.map(menu => menu.language_code), [undefined, "ru"]);
+assert.deepEqual(commandMenus[0].commands.slice(0, 3), [
+  {command: "verify", description: "Verify creator status"},
+  {command: "jetton", description: "Set the reward jetton for this chat (creators)"},
+  {command: "reward", description: "Grant points to a member (admins)"},
+]);
+assert.ok(commandMenus.every(menu => menu.commands.some(c => c.command === "lang")));
+assert.match(commandMenus[1].commands[0].description, /создатель/);
+
+// Until a group has a language, an announcement follows the member who triggered it.
+const MIXED = {id: -300, type: "supergroup", title: "Mixed"};
+await inChat(MIXED, speaker(11, "ru"), {sticker: {file_id: "s"}});
+await settle();
+assert.match(lastText(MIXED.id), /^Поздравляем, U11! Новое достижение: sticker!/);
+await inChat(MIXED, speaker(12, "en-US"), {sticker: {file_id: "s"}});
+await settle();
+assert.equal(lastText(MIXED.id), "Hey, U12! New achievement unlocked: sticker! Check it out in the mini app by @achivator_bot 🎉");
+const bolded = sent.at(-1).entities.find(e => e.type === "bold");
+assert.equal(sent.at(-1).text.slice(bolded.offset, bolded.offset + bolded.length), "sticker");
+await inChat(MIXED, speaker(13, "uk"), {sticker: {file_id: "s"}});
+await settle();
+assert.match(lastText(MIXED.id), /Новое достижение/, "Ukrainian clients get Russian");
+await inChat(MIXED, user(14), {sticker: {file_id: "s"}});
+await settle();
+assert.match(lastText(MIXED.id), /New achievement unlocked/, "no language_code means English");
+
+// Anyone can see the language, only the creator and admins change it.
+await inChat(MIXED, speaker(12, "en"), command("/lang"));
+assert.equal(lastText(MIXED.id), `${t("en", "langNotSet")}\n${t("en", "langUsage")}`);
+await inChat(MIXED, speaker(11, "ru"), command("/lang en"));
+assert.equal(lastText(MIXED.id), t("ru", "langAdminsOnly"));
+const ANONYMOUS = {id: 1087968824, is_bot: true, first_name: "Group"};
+statuses.set(ANONYMOUS.id, "error");
+await inChat(MIXED, ANONYMOUS, command("/lang@achivator_bot ru"));
+assert.equal(
+  lastText(MIXED.id),
+  "I cannot see who sent this (anonymous admin or a post on behalf of the channel).\n" +
+    "Post as yourself, or run the command in the linked discussion group.",
+);
+assert.equal((await database.collection("chats").findOne({id: MIXED.id}))?.lang, undefined);
+
+// An admin sets Russian: from now on even English speakers get Russian here,
+// although the chat's language was cached as unset a moment ago.
+const ADMIN = 15;
+statuses.set(ADMIN, "administrator");
+await inChat(MIXED, speaker(ADMIN, "en"), command("/lang de"));
+assert.equal(lastText(MIXED.id), `I don't speak "de" yet. Available: /lang ru or /lang en`);
+await inChat(MIXED, speaker(ADMIN, "en"), command("/lang RU"));
+assert.equal(lastText(MIXED.id), "Язык чата: русский. Теперь я пишу здесь по-русски.");
+assert.equal((await database.collection("chats").findOne({id: MIXED.id})).lang, "ru");
+await inChat(MIXED, speaker(16, "en"), {sticker: {file_id: "s"}});
+await settle();
+assert.match(lastText(MIXED.id), /^Поздравляем, U16!/);
+await inChat(MIXED, speaker(ADMIN, "en"), command("/reward 5"));
+assert.match(lastText(MIXED.id), /^В этом чате ещё не задан жетон/);
+await inChat(MIXED, speaker(12, "en"), command("/lang"));
+assert.equal(lastText(MIXED.id), "Язык чата: русский.\nИзменить (создатель и администраторы): /lang ru или /lang en");
+await inChat(MIXED, speaker(ADMIN, "ru"), command("/lang en"));
+assert.equal(lastText(MIXED.id), "Chat language set: English. I will write here in English.");
+await inChat(MIXED, speaker(17, "ru"), {sticker: {file_id: "s"}});
+await settle();
+assert.match(lastText(MIXED.id), /New achievement unlocked/);
+
+// A reward confirmation in a Russian group, with Russian plurals.
+statuses.set(CREATOR, "creator");
+await send(user(CREATOR), command("/lang ru"));
+const meme = await send(user(AUTHOR), {text: "meme"});
+await send(user(CREATOR), {...command("/reward 5 мем"), reply_to_message: {message_id: meme, date: 1, chat: CHAT, from: user(AUTHOR), text: "meme"}});
+assert.equal(lastText(CHAT.id), "U3: +5 баллов — мем\nИх можно будет забрать жетонами в мини-приложении, когда пройдёт срок созревания.");
+assert.deepEqual([1, 2, 5, 11, 21, 22, 112].map(n => t("ru", "rewardGranted", n, "X").split("\n")[0]),
+  ["X: +1 балл", "X: +2 балла", "X: +5 баллов", "X: +11 баллов", "X: +21 балл", "X: +22 балла", "X: +112 баллов"]);
+assert.equal(t("en", "rewardGranted", 5, "U3", null),
+  "+5 points to U3\nThey can claim them as jetton in the mini app once they mature.");
+statuses.delete(CREATOR);
+
+// Private chats follow the user's Telegram app.
+const DM = id => ({id, type: "private", first_name: `U${id}`});
+await inChat(DM(21), speaker(21, "ru"), command("/reward 5"));
+assert.equal(lastText(21), "Выполните /reward в группе или канале, где я администратор.");
+await inChat(DM(22), speaker(22, "en"), command("/reward 5"));
+assert.equal(lastText(22), "Run /reward in a group or channel where I am an admin.");
+await inChat(DM(21), speaker(21, "be"), command("/lang ru"));
+assert.match(lastText(21), /^В личном чате я пишу на языке вашего приложения Telegram/);
+
+// The bot greets a new group in the language of whoever added it; the English
+// replies quoted by the mini app setup guide keep their exact wording.
+const botStatus = (chat, from, status) => bot.handleUpdate({update_id: ++updateId, my_chat_member: {chat, from, date: 1,
+  old_chat_member: {user: bot.botInfo, status: "left"}, new_chat_member: {user: bot.botInfo, status}}});
+const NEW_EN = {id: -400, type: "group", title: "New"}, NEW_RU = {id: -401, type: "group", title: "Новая"};
+await botStatus(NEW_EN, speaker(31, "en"), "member");
+assert.equal(lastText(NEW_EN.id),
+  "Hello! I'm the Achivator Bot. I'm here to help you track and reward achievements in your chat. \n" +
+  "To get started, make sure to 1) grant me admin rights so that I could read messages and reactions, \n" +
+  "and 2) Verify as the chat creator /verify@achivator_bot.\n" +
+  "I don't store full message texts, just statistics, and I'm open source! \n" +
+  "You can find the source code at https://github.com/seniorsoftwarevlogger/achivator");
+await botStatus(NEW_EN, speaker(31, "en"), "administrator");
+assert.equal(lastText(NEW_EN.id),
+  "Thank you for granting me admin rights! I will now be able to track messages and reactions 🙌\n" +
+  "To reward members with jettons for positive reactions, the chat creator runs /jetton <jetton master address>.");
+await botStatus(NEW_RU, speaker(32, "ru"), "member");
+assert.match(lastText(NEW_RU.id), /^Привет! Я Achivator Bot\./);
+await botStatus(NEW_RU, speaker(32, "ru"), "administrator");
+assert.match(lastText(NEW_RU.id), /^Спасибо за права администратора!/);
+
+statuses.set(31, "creator");
+statuses.set(32, "creator");
+await inChat(NEW_EN, speaker(31, "en"), command("/verify"));
+assert.equal(lastText(NEW_EN.id), "Verified. You are creator. \nYou can now set Jetton for this chat and access other settings.");
+await inChat(NEW_RU, speaker(32, "ru"), command("/verify"));
+assert.equal(lastText(NEW_RU.id), "Подтверждено: вы создатель.\nТеперь можно задать жетон для этого чата и открыть остальные настройки.");
+await inChat(NEW_RU, speaker(ADMIN, "ru"), command("/verify"));
+assert.equal(lastText(NEW_RU.id), "Ваш статус — администратор, а подтвердить бота может только создатель чата.");
+const MASTER = "EQ" + "b".repeat(46);
+await inChat(NEW_EN, speaker(31, "en"), command(`/jetton ${MASTER}`));
+assert.equal(lastText(NEW_EN.id),
+  `Reward jetton set: ${MASTER}\n\n` +
+  "Next steps:\n" +
+  "1. Open the mini app and activate the chat pool (one-time, 0.3 TON).\n" +
+  "2. Top up the pool with your jettons.\n" +
+  "Members will then earn points for positive reactions and claim them as jettons.");
+await inChat(NEW_EN, speaker(33, "en"), command(`/jetton ${MASTER}`));
+assert.equal(lastText(NEW_EN.id), "Only the chat creator can set the reward jetton.");
+await inChat(NEW_RU, speaker(32, "ru"), command(`/jetton ${MASTER}`));
+assert.match(lastText(NEW_RU.id), /^Жетон для наград задан: EQb+\n\nЧто дальше:/);
+
+// A post on behalf of a channel has no sender: English, and no crash.
+const CHANNEL = {id: -600, type: "channel", title: "C"};
+const postInChannel = text => bot.handleUpdate({update_id: ++updateId, channel_post: {message_id: ++msgId, date: 1, chat: CHANNEL, text}});
+await postInChannel("/reward 5");
+assert.equal(lastText(CHANNEL.id),
+  "I cannot see who sent this (anonymous admin or a post on behalf of the channel).\n" +
+  "Post as yourself, or run the command in the linked discussion group.");
+await postInChannel("/lang ru");
+assert.equal(lastText(CHANNEL.id), t("en", "cannotSeeSender"));
+await postInChannel("/jetton");
+assert.equal(lastText(CHANNEL.id), "I cannot see who sent this (a post on behalf of the channel). Post as yourself to run /jetton.");
+
+// A missing key falls back to English, an unknown key does not throw.
+assert.equal(t("de", "jettonWhere"), "Run this command in a group or channel.");
+const originalError = console.error;
+console.error = () => {};
+assert.equal(t("ru", "noSuchKey"), "noSuchKey");
+console.error = originalError;
 
 console.log = originalLog;
 console.log("ALL OK");

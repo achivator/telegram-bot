@@ -1,11 +1,13 @@
 import * as dotenv from "dotenv";
 import {Telegraf, session} from "telegraf";
 import {channelPost, message} from "telegraf/filters";
-import {mention, fmt, bold, link} from "telegraf/format";
+import {mention} from "telegraf/format";
+import {LANGUAGES, langFromCode, t} from "./i18n.mjs";
 
 dotenv.config();
 
 const NFT_COLLECTION = "v1";
+const MINI_APP_URL = "https://t.me/achivator_bot/app";
 
 // Fire-and-forget: a metrics outage must never surface as an unhandled
 // rejection (which terminates Node) or block an update handler.
@@ -45,8 +47,8 @@ function normalizeEmoji(emoji) {
   return String(emoji).replace(/\uFE0F/g, "");
 }
 
-function mentionUser(user) {
-  return mention(user.first_name || user.username || "member", user);
+function mentionUser(user, lang) {
+  return mention(user.first_name || user.username || t(lang, "member"), user);
 }
 
 // Awards `achievement` to `user` (the sender of the update by default) once per
@@ -77,13 +79,10 @@ async function giveAchievement(ctx, dbCollection, achievement, {user = ctx.from,
 
     console.log(`User ${user_id} got achievement ${achievement} in chat ${chat_id}`);
 
+    // the achievement name is also the medal's id, only the sentence is translated
+    const lang = await ctx.state.lang();
     ctx
-      .sendMessage(
-        fmt`Hey, ${mentionUser(user)}! New achievement unlocked: ${bold(achievement)}! Check it out in ${link(
-          "the mini app",
-          "https://t.me/achivator_bot/app",
-        )} by @achivator_bot 🎉`,
-      )
+      .sendMessage(t(lang, "achievementUnlocked", mentionUser(user, lang), achievement, MINI_APP_URL))
       .then(botReply => setTimeout(() => ctx.deleteMessage(botReply.message_id).catch(console.error), 30000))
       .catch(console.error);
 
@@ -134,16 +133,39 @@ export default function createBot(database, token, options) {
   const CREATOR_MULTIPLIER = Number(process.env.CREATOR_MULTIPLIER || 10);
   const CHAT_CONFIG_TTL_MS = 5 * 60 * 1000;
 
-  const chatConfigCache = new Map(); // chat_id -> {value, expiresAt}
+  // chat_id -> {value, expiresAt}; delete a chat's entry after changing its
+  // jetton, creator or language
+  const chatConfigCache = new Map();
 
-  async function getChatRewardConfig(chat_id) {
+  async function getChatConfig(chat_id) {
     const cached = chatConfigCache.get(chat_id);
     if (cached && cached.expiresAt > Date.now()) return cached.value;
 
     const chat = await chats.findOne({id: chat_id});
-    const value = {jetton_master: chat?.jetton_master || null, creator: chat?.creator ?? null};
+    const value = {
+      jetton_master: chat?.jetton_master || null,
+      creator: chat?.creator ?? null,
+      lang: LANGUAGES.includes(chat?.lang) ? chat.lang : null,
+    };
     chatConfigCache.set(chat_id, {value, expiresAt: Date.now() + CHAT_CONFIG_TTL_MS});
     return value;
+  }
+
+  // ---- Languages ----
+  // In a private chat the bot answers in the user's Telegram app language. A
+  // group or channel reads one language, set by the creator or an admin with
+  // /lang; until then each reply follows whoever triggered it (the member who
+  // wrote, reacted or added the bot). Posts on behalf of a channel and
+  // anonymous admins carry no language_code: English, unless the chat has one.
+  async function langFor(ctx) {
+    const userLang = langFromCode(ctx.from?.language_code);
+    if (!ctx.chat || ctx.chat.type === "private") return userLang;
+    // a reply in the wrong language beats no reply
+    const config = await getChatConfig(ctx.chat.id).catch(error => {
+      console.error("chat language lookup failed:", error);
+      return null;
+    });
+    return config?.lang || userLang;
   }
 
   // ---- Anti-farming ----
@@ -235,7 +257,7 @@ export default function createBot(database, token, options) {
     if (positiveRemove.length > 0 && delta === 0) noReward(`removed ${positiveRemove.join(" ")} had not been paid`);
 
     if (positiveAdd.length > 0) {
-      const config = await getChatRewardConfig(chat_id);
+      const config = await getChatConfig(chat_id);
       // any message type counts: a member who only posts stickers or voice
       // messages is as real as one who types
       const written = config.jetton_master
@@ -301,12 +323,6 @@ export default function createBot(database, token, options) {
   const ADMIN_STATUSES = new Set(["creator", "administrator"]);
   const MAX_GRANT_POINTS = Number(process.env.REWARD_MAX_POINTS || 1000);
 
-  const REWARD_USAGE =
-    "Grant points to a member:\n" +
-    "• as a reply: /reward <points> [reason]\n" +
-    "• by mention or id: /reward <@username or user id> <points> [reason]\n" +
-    `Points: 1…${MAX_GRANT_POINTS}. Only the creator and admins (including admin bots) can grant.`;
-
   // One grant per Telegram message: polling can redeliver an update after a
   // restart, and a bot-to-bot loop must not be able to mint points twice.
   grants
@@ -345,47 +361,31 @@ export default function createBot(database, token, options) {
   }
 
   // Channels and anonymous admin posts hide the author, so there is nobody whose
-  // admin rights could be checked.
-  async function requireGranter(ctx) {
-    if (!ctx.from) {
-      return {
-        ok: false,
-        error:
-          "I cannot see who sent this (anonymous admin or a post on behalf of the channel).\n" +
-          "Post as yourself, or run the command in the linked discussion group.",
-      };
-    }
+  // admin rights could be checked. `deniedKey` is the reply for a non-admin.
+  async function requireAdmin(ctx, lang, deniedKey) {
     const member = ctx.from ? await ctx.getChatMember(ctx.from.id).catch(() => null) : null;
-    if (!member) {
-      return {
-        ok: false,
-        error:
-          "I cannot see who sent this (anonymous admin or a post on behalf of the channel).\n" +
-          "Post as yourself, or run the command in the linked discussion group.",
-      };
-    }
-    if (!ADMIN_STATUSES.has(member.status)) {
-      return {ok: false, error: "Only the chat creator and admins can grant rewards (I must be an admin to check)."};
-    }
+    if (!member) return {ok: false, error: t(lang, "cannotSeeSender")};
+    if (!ADMIN_STATUSES.has(member.status)) return {ok: false, error: t(lang, deniedKey)};
     return {ok: true, member};
   }
 
   async function handleReward(ctx) {
+    const lang = await ctx.state.lang();
     const type = ctx.chat?.type;
     if (type !== "group" && type !== "supergroup" && type !== "channel") {
-      await ctx.reply("Run /reward in a group or channel where I am an admin.");
+      await ctx.reply(t(lang, "rewardWhere"));
       return;
     }
 
-    const granter = await requireGranter(ctx);
+    const granter = await requireAdmin(ctx, lang, "rewardAdminsOnly");
     if (!granter.ok) {
       await ctx.reply(granter.error);
       return;
     }
 
-    const config = await getChatRewardConfig(ctx.chat.id);
+    const config = await getChatConfig(ctx.chat.id);
     if (!config.jetton_master) {
-      await ctx.reply("This chat has no reward jetton yet. The creator should run /jetton <master address> first.");
+      await ctx.reply(t(lang, "rewardNoJetton"));
       return;
     }
 
@@ -398,10 +398,7 @@ export default function createBot(database, token, options) {
 
     if (replyTo) {
       if (!replyTo.from || replyTo.from.is_bot) {
-        await ctx.reply(
-          "That message has no author I can reward (a bot or an anonymous channel post).\n" +
-            "Grant by id instead: /reward <user id> <points> [reason]",
-        );
+        await ctx.reply(t(lang, "rewardNoAuthor"));
         return;
       }
       target = {id: replyTo.from.id, name: replyTo.from.first_name || replyTo.from.username || String(replyTo.from.id)};
@@ -411,7 +408,7 @@ export default function createBot(database, token, options) {
       if (first?.startsWith("@")) {
         const found = await ctx.telegram.getChatMember(ctx.chat.id, first.slice(1)).catch(() => null);
         if (!found?.user) {
-          await ctx.reply(`I cannot resolve ${first}: they must be a member of this chat.`);
+          await ctx.reply(t(lang, "rewardCannotResolve", first));
           return;
         }
         target = {id: found.user.id, name: found.user.first_name || first.slice(1)};
@@ -422,7 +419,7 @@ export default function createBot(database, token, options) {
 
     const points = Number(args[0]);
     if (!target || !Number.isInteger(points) || points < 1 || points > MAX_GRANT_POINTS) {
-      await ctx.reply(REWARD_USAGE);
+      await ctx.reply(t(lang, "rewardUsage", MAX_GRANT_POINTS));
       return;
     }
 
@@ -451,48 +448,34 @@ export default function createBot(database, token, options) {
         (grant.reason ? `: ${grant.reason}` : ""),
     );
 
-    await ctx.reply(
-      `+${grant.points} points to ${target.name}` +
-        (grant.reason ? ` — ${grant.reason}` : "") +
-        "\nThey can claim them as jetton in the mini app once they mature.",
-      {reply_to_message_id: replyTo?.message_id},
-    );
+    await ctx.reply(t(lang, "rewardGranted", grant.points, target.name, grant.reason), {
+      reply_to_message_id: replyTo?.message_id,
+    });
   }
 
   async function handleJetton(ctx) {
+    const lang = await ctx.state.lang();
     const type = ctx.chat?.type;
     if (type !== "group" && type !== "supergroup" && type !== "channel") {
-      ctx.reply("Run this command in a group or channel.");
+      await ctx.reply(t(lang, "jettonWhere"));
       return;
     }
 
     const member = ctx.from ? await ctx.getChatMember(ctx.from.id).catch(() => null) : null;
     if (member?.status !== "creator") {
-      ctx.reply(
-        ctx.from
-          ? "Only the chat creator can set the reward jetton."
-          : "I cannot see who sent this (a post on behalf of the channel). Post as yourself to run /jetton.",
-      );
+      await ctx.reply(t(lang, ctx.from ? "jettonCreatorOnly" : "jettonCannotSeeSender"));
       return;
     }
 
     const arg = ((ctx.message || ctx.channelPost).text || "").split(/\s+/)[1];
     if (!arg) {
       const chat = await chats.findOne({id: ctx.chat.id});
-      ctx.reply(
-        chat?.jetton_master
-          ? `Current reward jetton: ${chat.jetton_master}\n\n` +
-              `Members earn points for positive reactions and claim them as jettons in the mini app.\n` +
-              `To change the jetton: /jetton <master address>`
-          : `No reward jetton set for this chat yet.\n\n` +
-              `To enable rewards: /jetton <jetton master address>\n` +
-              `You will need the jettons in your wallet to top up the pool later.`,
-      );
+      await ctx.reply(chat?.jetton_master ? t(lang, "jettonCurrent", chat.jetton_master) : t(lang, "jettonNotSet"));
       return;
     }
 
     if (!isTonAddress(arg)) {
-      ctx.reply("That does not look like a TON jetton master address (EQ... / UQ... / 0:...).");
+      await ctx.reply(t(lang, "jettonInvalid"));
       return;
     }
 
@@ -503,24 +486,71 @@ export default function createBot(database, token, options) {
     );
     chatConfigCache.delete(ctx.chat.id);
 
-    ctx.reply(
-      `Reward jetton set: ${arg}\n\n` +
-        `Next steps:\n` +
-        `1. Open the mini app and activate the chat pool (one-time, 0.3 TON).\n` +
-        `2. Top up the pool with your jettons.\n` +
-        `Members will then earn points for positive reactions and claim them as jettons.`,
-    );
+    await ctx.reply(t(lang, "jettonSet", arg));
   }
 
-  telegraf.telegram
-    .setMyCommands([
-      {command: "verify", description: "Verify creator status"},
-      {command: "jetton", description: "Set the reward jetton for this chat (creators)"},
-      {command: "reward", description: "Grant points to a member (admins)"},
-    ])
-    .catch(console.error);
+  // /lang shows the chat's language, /lang ru|en changes it (creator and
+  // admins). The reply to a change is already in the new language.
+  async function handleLang(ctx) {
+    const lang = await ctx.state.lang();
+    const type = ctx.chat?.type;
+    if (type !== "group" && type !== "supergroup" && type !== "channel") {
+      await ctx.reply(t(lang, "langPrivate"));
+      return;
+    }
+
+    const arg = ((ctx.message || ctx.channelPost).text || "").split(/\s+/)[1]?.toLowerCase();
+    if (!arg) {
+      const config = await getChatConfig(ctx.chat.id);
+      const current = config.lang ? t(lang, "langCurrent", t(config.lang, "languageName")) : t(lang, "langNotSet");
+      await ctx.reply(`${current}\n${t(lang, "langUsage")}`);
+      return;
+    }
+
+    const admin = await requireAdmin(ctx, lang, "langAdminsOnly");
+    if (!admin.ok) {
+      await ctx.reply(admin.error);
+      return;
+    }
+
+    if (!LANGUAGES.includes(arg)) {
+      await ctx.reply(t(lang, "langUnknown", arg.slice(0, 20)));
+      return;
+    }
+
+    await chats.updateOne(
+      {id: ctx.chat.id},
+      {$set: {lang: arg}, $setOnInsert: {title: ctx.chat.title || null}},
+      {upsert: true},
+    );
+    chatConfigCache.delete(ctx.chat.id);
+    console.log(`chat ${ctx.chat.id} language set to ${arg} by ${ctx.from.id}`);
+
+    await ctx.reply(t(arg, "langSet", t(arg, "languageName")));
+  }
+
+  // Command menus: English by default, Russian for Russian Telegram apps. Runs
+  // once per bot start; a failure only leaves the old menu in place.
+  for (const lang of LANGUAGES) {
+    const commands = [
+      {command: "verify", description: t(lang, "commandVerify")},
+      {command: "jetton", description: t(lang, "commandJetton")},
+      {command: "reward", description: t(lang, "commandReward")},
+      {command: "lang", description: t(lang, "commandLang")},
+    ];
+    telegraf.telegram.setMyCommands(commands, lang === "en" ? {} : {language_code: lang}).catch(console.error);
+  }
+
+  // Every reply of an update goes out in one language, resolved on first use:
+  // `await ctx.state.lang()`.
+  telegraf.use((ctx, next) => {
+    let lang;
+    ctx.state.lang = () => (lang ??= langFor(ctx));
+    return next();
+  });
 
   telegraf.command("reward", handleReward);
+  telegraf.command("lang", handleLang);
 
   // A channel post is not a `message`, so Telegraf's command middleware never
   // sees commands typed inside a channel; dispatch them here.
@@ -531,6 +561,7 @@ export default function createBot(database, token, options) {
     if (match[2] && match[2].toLowerCase() !== String(me).toLowerCase()) return next();
     if (match[1] === "reward") return handleReward(ctx);
     if (match[1] === "jetton") return handleJetton(ctx);
+    if (match[1] === "lang") return handleLang(ctx);
     return next();
   });
 
@@ -547,30 +578,28 @@ export default function createBot(database, token, options) {
         await database.collection("chats").insertOne(item.chat, {upsert: true});
       }
     }
-    ctx.reply("Migration completed");
+    await ctx.reply(t(await ctx.state.lang(), "migrationCompleted"));
   });
 
   telegraf.command("verify", async ctx => {
+    const lang = await ctx.state.lang();
     const type = ctx.chat?.type;
     if (type !== "group" && type !== "supergroup") {
-      await ctx.reply("Run /verify in the group you created.");
+      await ctx.reply(t(lang, "verifyWhere"));
       return;
     }
     const member = await ctx.getChatMember(ctx.from.id).catch(() => null);
     if (!member) {
-      await ctx.reply("I cannot check your status here. Make sure I am an admin of this chat.");
+      await ctx.reply(t(lang, "verifyCannotCheck"));
       return;
     }
     if (member.status !== "creator") {
-      await ctx.reply(`You are ${member.status}, but only chat creators can verify the bot.`);
+      await ctx.reply(t(lang, "verifyNotCreator", t(lang, "memberStatus", member.status)));
       return;
     }
     await chats.updateOne({id: ctx.chat.id}, {$set: {creator: member.user.id}}, {upsert: true});
     chatConfigCache.delete(ctx.chat.id);
-    await ctx.reply(
-      `Verified. You are ${member.status}. 
-You can now set Jetton for this chat and access other settings.`,
-    );
+    await ctx.reply(t(lang, "verified", t(lang, "memberStatus", member.status)));
   });
 
   telegraf.command("jetton", handleJetton);
@@ -581,22 +610,14 @@ You can now set Jetton for this chat and access other settings.`,
     const status = ctx.update.my_chat_member.new_chat_member?.status;
 
     // if bot was added to a new chat, announce itself and suggest granting admin rights so that it could read messages.
+    // Until the chat has a language, it greets in the language of whoever added it.
     if (status === "member") {
-      ctx.reply(
-        `Hello! I'm the Achivator Bot. I'm here to help you track and reward achievements in your chat. 
-To get started, make sure to 1) grant me admin rights so that I could read messages and reactions, 
-and 2) Verify as the chat creator /verify@achivator_bot.
-I don't store full message texts, just statistics, and I'm open source! 
-You can find the source code at https://github.com/seniorsoftwarevlogger/achivator`,
-      );
+      await ctx.reply(t(await ctx.state.lang(), "greeting"));
     }
 
     // Check if the bot was granted admin rights
     if (status === "administrator") {
-      ctx.reply(
-        "Thank you for granting me admin rights! I will now be able to track messages and reactions 🙌\n" +
-          "To reward members with jettons for positive reactions, the chat creator runs /jetton <jetton master address>.",
-      );
+      await ctx.reply(t(await ctx.state.lang(), "adminThanks"));
     }
 
     next();
@@ -681,7 +702,7 @@ You can find the source code at https://github.com/seniorsoftwarevlogger/achivat
           authorUser ??= await ctx
             .getChatMember(receiver.user_id)
             .then(member => member.user)
-            .catch(() => ({id: receiver.user_id, first_name: "member"}));
+            .catch(() => ({id: receiver.user_id})); // mentionUser names them "member"
           giveAchievement(ctx, achievements, achievement, {user: authorUser, message_id});
         }
       }
