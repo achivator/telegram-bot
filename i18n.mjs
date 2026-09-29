@@ -10,15 +10,12 @@ import {fmt, bold, link} from "telegraf/format";
 
 export const LANGUAGES = ["en", "ru"];
 
-// Telegram clients in these languages get Russian: their users read it far
-// more often than English.
-const RUSSIAN_READERS = new Set(["ru", "uk", "be", "kk"]);
-
 // Maps a Telegram `language_code` ("ru", "uk", "en-US", undefined) to one of
-// LANGUAGES.
+// LANGUAGES. Only Russian Telegram apps get Russian; every other language,
+// Ukrainian, Belarusian and Kazakh included, gets English.
 export function langFromCode(code) {
   const base = String(code || "").toLowerCase().split(/[-_]/)[0];
-  return RUSSIAN_READERS.has(base) ? "ru" : "en";
+  return LANGUAGES.includes(base) ? base : "en";
 }
 
 // 1 балл, 2 балла, 5 баллов, 11 баллов, 21 балл
@@ -28,6 +25,25 @@ function ruPlural(n, one, few, many) {
   if (mod10 === 1 && mod100 !== 11) return one;
   if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return few;
   return many;
+}
+
+// Point price announcements show the moment of a change explicitly in UTC:
+// "5 Oct 2026, 12:00 UTC", "5 октября 2026, 12:00 UTC".
+const EN_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const RU_MONTHS = [
+  "января", "февраля", "марта", "апреля", "мая", "июня",
+  "июля", "августа", "сентября", "октября", "ноября", "декабря",
+];
+
+function utcDateTime(value, months) {
+  const date = new Date(value);
+  const time = date.toISOString().slice(11, 16);
+  return `${date.getUTCDate()} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()}, ${time} UTC`;
+}
+
+// Prices arrive as canonical decimal strings ("0.25"); Russian writes "0,25".
+function ruDecimal(value) {
+  return String(value).replace(".", ",");
 }
 
 const en = {
@@ -51,6 +67,22 @@ const en = {
     "Thank you for granting me admin rights! I will now be able to track messages and reactions 🙌\n" +
     "To reward members with jettons for positive reactions, the chat creator runs /jetton <jetton master address>.",
 
+  // /start and /help in a private chat, with buttons below the text
+  welcome:
+    "Hi! I'm Achivator, a loyalty system for Telegram chats.\n\n" +
+    "Members react to helpful messages, and their authors earn points. Points are claimed as the chat's " +
+    "own jetton, and along the way members unlock achievements.\n\n" +
+    "To set it up: add me to your group, make me an admin and follow the setup guide.",
+  buttonOpenApp: "Open the app",
+  buttonAddToGroup: "Add to a group",
+  buttonSetupGuide: "Setup guide",
+  setupGuideUrl: "https://achivator.cc/en/help",
+  // /start and /help in a group
+  startGroupSetup: guideUrl =>
+    "To get started, make me an admin, then the chat creator runs /verify@achivator_bot.\n" +
+    `Setup guide: ${guideUrl}`,
+  startGroupReady: guideUrl => `I'm already an admin here. Setup guide: ${guideUrl}`,
+
   cannotSeeSender:
     "I cannot see who sent this (anonymous admin or a post on behalf of the channel).\n" +
     "Post as yourself, or run the command in the linked discussion group.",
@@ -62,6 +94,8 @@ const en = {
     "That message has no author I can reward (a bot or an anonymous channel post).\n" +
     "Grant by id instead: /reward <user id> <points> [reason]",
   rewardCannotResolve: username => `I cannot resolve ${username}: they must be a member of this chat.`,
+  rewardUnknownUsername: username =>
+    `I haven't seen ${username} in this chat yet — reply to their message instead: /reward <points> [reason]`,
   rewardUsage: maxPoints =>
     "Grant points to a member:\n" +
     "• as a reply: /reward <points> [reason]\n" +
@@ -108,6 +142,22 @@ const en = {
 
   migrationCompleted: "Migration completed",
 
+  // Point price changes made in the mini app. `symbol` is the reward jetton's
+  // symbol, null when unknown.
+  priceDecreaseScheduled: ({from, to, symbol, effective_at}) =>
+    `The price of a point will drop on ${utcDateTime(effective_at, EN_MONTHS)}: ` +
+    `1 point = ${from} → ${to} ${symbol || "jetton"}.\n` +
+    "Points already earned can be claimed at the current price until then — open the mini app.",
+  priceDecreased: ({from, to, symbol}) =>
+    `The price of a point has dropped: 1 point = ${to} ${symbol || "jetton"} (was ${from}).`,
+  priceIncreased: ({from, to, symbol, cancelled_pending}) =>
+    `The price of a point has gone up: 1 point = ${to} ${symbol || "jetton"} (was ${from}).` +
+    (cancelled_pending ? "\nThe planned decrease is cancelled." : ""),
+  priceDecreaseCancelled: ({from, symbol}) =>
+    `The planned price decrease is cancelled: 1 point stays ${from} ${symbol || "jetton"}.`,
+
+  commandStart: "What Achivator is and how to set it up",
+  commandHelp: "Setup guide",
   commandVerify: "Verify creator status",
   commandJetton: "Set the reward jetton for this chat (creators)",
   commandReward: "Grant points to a member (admins)",
@@ -145,6 +195,20 @@ const ru = {
     "Чтобы награждать участников жетонами за положительные реакции, создатель чата выполняет " +
     "/jetton <адрес мастер-контракта жетона>.",
 
+  welcome:
+    "Привет! Я Achivator — система лояльности для чатов в Telegram.\n\n" +
+    "Участники ставят реакции на полезные сообщения, а их авторы получают баллы. Баллы можно забрать " +
+    "собственным жетоном чата, а по пути участники открывают достижения.\n\n" +
+    "Как подключить: добавьте меня в группу, сделайте администратором и следуйте инструкции по настройке.",
+  buttonOpenApp: "Открыть приложение",
+  buttonAddToGroup: "Добавить в группу",
+  buttonSetupGuide: "Инструкция по настройке",
+  setupGuideUrl: "https://achivator.cc/ru/help",
+  startGroupSetup: guideUrl =>
+    "Чтобы начать, сделайте меня администратором, затем создатель чата выполняет /verify@achivator_bot.\n" +
+    `Инструкция по настройке: ${guideUrl}`,
+  startGroupReady: guideUrl => `Я уже администратор в этом чате. Инструкция по настройке: ${guideUrl}`,
+
   cannotSeeSender:
     "Я не вижу, кто это отправил (анонимный администратор или пост от имени канала).\n" +
     "Напишите от своего имени или выполните команду в привязанной группе обсуждения.",
@@ -159,6 +223,8 @@ const ru = {
     "У этого сообщения нет автора, которого можно наградить (бот или анонимный пост канала).\n" +
     "Начислите по id: /reward <id пользователя> <баллы> [причина]",
   rewardCannotResolve: username => `Не могу найти ${username}: пользователь должен быть участником этого чата.`,
+  rewardUnknownUsername: username =>
+    `Я ещё не видел ${username} в этом чате — ответьте на его сообщение: /reward <баллы> [причина]`,
   rewardUsage: maxPoints =>
     "Начислить баллы участнику:\n" +
     "• ответом на его сообщение: /reward <баллы> [причина]\n" +
@@ -208,6 +274,20 @@ const ru = {
 
   migrationCompleted: "Миграция завершена",
 
+  priceDecreaseScheduled: ({from, to, symbol, effective_at}) =>
+    `Цена балла снизится ${utcDateTime(effective_at, RU_MONTHS)}: ` +
+    `1 балл = ${ruDecimal(from)} → ${ruDecimal(to)} ${symbol || "жетона"}.\n` +
+    "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.",
+  priceDecreased: ({from, to, symbol}) =>
+    `Цена балла снизилась: 1 балл = ${ruDecimal(to)} ${symbol || "жетона"} (было ${ruDecimal(from)}).`,
+  priceIncreased: ({from, to, symbol, cancelled_pending}) =>
+    `Цена балла выросла: 1 балл = ${ruDecimal(to)} ${symbol || "жетона"} (было ${ruDecimal(from)}).` +
+    (cancelled_pending ? "\nЗапланированное снижение отменено." : ""),
+  priceDecreaseCancelled: ({from, symbol}) =>
+    `Запланированное снижение цены балла отменено: 1 балл по-прежнему стоит ${ruDecimal(from)} ${symbol || "жетона"}.`,
+
+  commandStart: "Что такое Achivator и как его подключить",
+  commandHelp: "Инструкция по настройке",
   commandVerify: "Подтвердить, что вы создатель чата",
   commandJetton: "Задать жетон для наград в этом чате (создатель)",
   commandReward: "Начислить баллы участнику (администраторы)",

@@ -57,6 +57,14 @@ const allowedUpdates = [
 
 bot.launch({ ...botOptions, allowedUpdates });
 
+// Point price announcements queued by the mini app, and scheduled price
+// decreases that fall due (ANNOUNCE_INTERVAL_MS).
+bot.announcements.start();
+
 // Enable graceful stop
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    bot.announcements.stop();
+    bot.stop(signal);
+  });
+}

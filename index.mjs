@@ -8,6 +8,7 @@ dotenv.config();
 
 const NFT_COLLECTION = "v1";
 const MINI_APP_URL = "https://t.me/achivator_bot/app";
+const ADD_TO_GROUP_URL = "https://t.me/achivator_bot?startgroup=true";
 
 // Fire-and-forget: a metrics outage must never surface as an unhandled
 // rejection (which terminates Node) or block an update handler.
@@ -118,6 +119,7 @@ export default function createBot(database, token, options) {
   const chats = database.collection("chats");
   const rewards = database.collection("rewards");
   const grants = database.collection("grants");
+  const users = database.collection("users");
 
   // ---- Jetton rewards ----
   // A chat rewards its members with jetton points once the creator has set a
@@ -315,6 +317,49 @@ export default function createBot(database, token, options) {
     );
   }
 
+  // ---- Known users ----
+  // Telegram's Bot API cannot look a user up by @username, so the bot keeps
+  // the usernames of the people it sees (messages, reactions, commands) to
+  // resolve `/reward @username`. A username belongs to one account at a time:
+  // whoever had it before is cleared when someone else shows up with it.
+  const USER_REFRESH_MS = 24 * 60 * 60 * 1000;
+  const MAX_CACHED_USERS = 50000;
+  // user id -> {key, at}: skips the write while name and username are unchanged
+  const seenUsers = new Map();
+
+  users.createIndex({id: 1}, {unique: true}).catch(console.error);
+  users.createIndex({username: 1}).catch(console.error);
+
+  async function rememberUser(user) {
+    const username = user.username ? user.username.toLowerCase() : null;
+    const key = `${username}|${user.first_name || ""}`;
+    const cached = seenUsers.get(user.id);
+    if (cached?.key === key && Date.now() - cached.at < USER_REFRESH_MS) return;
+
+    await users.updateOne(
+      {id: user.id},
+      {$set: {username, first_name: user.first_name || null, updated_at: new Date()}},
+      {upsert: true},
+    );
+    if (username && cached?.key !== key) {
+      await users.updateMany({username, id: {$ne: user.id}}, {$set: {username: null}});
+    }
+    if (seenUsers.size >= MAX_CACHED_USERS) seenUsers.clear();
+    seenUsers.set(user.id, {key, at: Date.now()});
+  }
+
+  // The member of this chat who goes by `@username` (any case), or why not.
+  const MEMBER_STATUSES = new Set(["creator", "administrator", "member", "restricted"]);
+  async function findMemberByUsername(ctx, username) {
+    const known = await users.findOne({username: username.toLowerCase()});
+    if (!known) return {error: "rewardUnknownUsername"};
+    const member = await ctx.telegram.getChatMember(ctx.chat.id, known.id).catch(() => null);
+    if (!member?.user || !MEMBER_STATUSES.has(member.status) || member.is_member === false) {
+      return {error: "rewardCannotResolve"};
+    }
+    return {user: member.user};
+  }
+
   // ---- Manual grants ----
   // Points also appear without a reaction: an admin (a human or another bot
   // with Bot-to-Bot Communication Mode, e.g. a channel publisher that knows who
@@ -406,9 +451,9 @@ export default function createBot(database, token, options) {
       const first = tokens[0];
       args = tokens.slice(1);
       if (first?.startsWith("@")) {
-        const found = await ctx.telegram.getChatMember(ctx.chat.id, first.slice(1)).catch(() => null);
-        if (!found?.user) {
-          await ctx.reply(t(lang, "rewardCannotResolve", first));
+        const found = await findMemberByUsername(ctx, first.slice(1));
+        if (found.error) {
+          await ctx.reply(t(lang, found.error, first));
           return;
         }
         target = {id: found.user.id, name: found.user.first_name || first.slice(1)};
@@ -529,16 +574,75 @@ export default function createBot(database, token, options) {
     await ctx.reply(t(arg, "langSet", t(arg, "languageName")));
   }
 
-  // Command menus: English by default, Russian for Russian Telegram apps. Runs
+  // ---- /start and /help ----
+  // A private chat gets a short introduction with buttons. The mini app button
+  // is a plain link to its t.me address rather than a `web_app` button: a
+  // web_app button needs the app's own HTTPS address, which lives in the mini
+  // app's BotFather settings, and the t.me link opens the same app the same
+  // way everywhere else the bot links to it.
+  //
+  // In a group the bot stays brief. Telegram's "Add to group" flow sends
+  // `/start@achivator_bot true` right after the bot joins, when it has just
+  // greeted the group (my_chat_member), so a setup hint then would repeat the
+  // greeting; for a group where the bot is already an admin the automatic
+  // /start needs no answer at all. A member who types /start or /help gets one
+  // line: the setup hint, or where the guide is.
+  const GREETING_QUIET_MS = 60 * 1000;
+  const greetedAt = new Map(); // chat_id -> ms of the last greeting
+
+  function rememberGreeting(chat_id) {
+    const now = Date.now();
+    for (const [id, at] of greetedAt) if (now - at > GREETING_QUIET_MS) greetedAt.delete(id);
+    greetedAt.set(chat_id, now);
+  }
+
+  async function handleStart(ctx) {
+    const lang = await ctx.state.lang();
+    if (ctx.chat?.type === "private") {
+      // a /start payload from a deep link carries nothing the bot acts on yet
+      await ctx.reply(t(lang, "welcome"), {
+        reply_markup: {
+          inline_keyboard: [
+            [{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}],
+            [{text: t(lang, "buttonAddToGroup"), url: ADD_TO_GROUP_URL}],
+            [{text: t(lang, "buttonSetupGuide"), url: t(lang, "setupGuideUrl")}],
+          ],
+        },
+      });
+      return;
+    }
+    if (!isGroup(ctx)) return;
+
+    const noPreview = {link_preview_options: {is_disabled: true}};
+    const me = await ctx.getChatMember(ctx.botInfo.id).catch(() => null);
+    if (me?.status === "administrator") {
+      if (ctx.command === "start" && ctx.payload) return; // automatic, from "Add to group"
+      await ctx.reply(t(lang, "startGroupReady", t(lang, "setupGuideUrl")), noPreview);
+      return;
+    }
+    if (Date.now() - (greetedAt.get(ctx.chat.id) ?? 0) < GREETING_QUIET_MS) return;
+    await ctx.reply(t(lang, "startGroupSetup", t(lang, "setupGuideUrl")), noPreview);
+  }
+
+  // Command menus: English by default, Russian for Russian Telegram apps; a
+  // private chat lists /start and /help, groups list the chat commands. Runs
   // once per bot start; a failure only leaves the old menu in place.
   for (const lang of LANGUAGES) {
-    const commands = [
-      {command: "verify", description: t(lang, "commandVerify")},
-      {command: "jetton", description: t(lang, "commandJetton")},
-      {command: "reward", description: t(lang, "commandReward")},
-      {command: "lang", description: t(lang, "commandLang")},
+    // "reward" is described by the "commandReward" text
+    const describe = command => ({
+      command,
+      description: t(lang, `command${command[0].toUpperCase()}${command.slice(1)}`),
+    });
+    const chatCommands = ["verify", "jetton", "reward", "lang"].map(describe);
+    const menus = [
+      [chatCommands, {type: "default"}],
+      [["start", "help"].map(describe), {type: "all_private_chats"}],
+      [[...chatCommands, describe("help")], {type: "all_group_chats"}],
     ];
-    telegraf.telegram.setMyCommands(commands, lang === "en" ? {} : {language_code: lang}).catch(console.error);
+    for (const [commands, scope] of menus) {
+      const extra = lang === "en" ? {scope} : {scope, language_code: lang};
+      telegraf.telegram.setMyCommands(commands, extra).catch(console.error);
+    }
   }
 
   // Every reply of an update goes out in one language, resolved on first use:
@@ -549,8 +653,18 @@ export default function createBot(database, token, options) {
     return next();
   });
 
+  // Bots (including anonymous admins and channel posts) have no username to
+  // reward by. A failed write only costs a later `/reward @username`.
+  telegraf.use(async (ctx, next) => {
+    if (ctx.from && !ctx.from.is_bot) {
+      await rememberUser(ctx.from).catch(error => console.error("remembering user failed:", error));
+    }
+    return next();
+  });
+
   telegraf.command("reward", handleReward);
   telegraf.command("lang", handleLang);
+  telegraf.command(["start", "help"], handleStart);
 
   // A channel post is not a `message`, so Telegraf's command middleware never
   // sees commands typed inside a channel; dispatch them here.
@@ -611,7 +725,9 @@ export default function createBot(database, token, options) {
 
     // if bot was added to a new chat, announce itself and suggest granting admin rights so that it could read messages.
     // Until the chat has a language, it greets in the language of whoever added it.
-    if (status === "member") {
+    // In a private chat "member" means the user unblocked the bot: nothing to say.
+    if (status === "member" && isGroup(ctx)) {
+      rememberGreeting(ctx.chat.id);
       await ctx.reply(t(await ctx.state.lang(), "greeting"));
     }
 
@@ -817,6 +933,228 @@ export default function createBot(database, token, options) {
 
     next();
   });
+
+  // ---- Point price announcements ----
+  // The chat creator changes the price of a point in the mini app. An increase
+  // applies at once; a decrease is scheduled (chats.point_price_pending) so
+  // members can still claim at the old price. The mini app queues what the
+  // chat should hear in the `announcements` outbox:
+  //   {chat_id, type, params, created_at, sent_at: null, claimed_at: null, attempts: 0}
+  // with type "price_decrease_scheduled" {from, to, symbol, effective_at},
+  // "price_decrease_cancelled" {from, to, symbol}, "price_increased"
+  // {from, to, symbol, cancelled_pending} or "price_decreased" {from, to,
+  // symbol}. The bot sends those, applies decreases that are due and
+  // announces them itself; the mini app queues "price_decreased" only when it
+  // applied a due decrease before the bot did (a new price saved after
+  // effective_at). Prices are decimal
+  // strings; a chat without point_price uses the platform default, which the
+  // bot does not know. The bot caches nothing price-related (getChatConfig),
+  // so an applied decrease invalidates no cache.
+  //
+  // Every step claims its work atomically, so overlapping runs (a slow tick,
+  // a second process) never send an announcement or apply a decrease twice.
+  // Runs on a timer started by standalone.mjs: `bot.announcements.start()`.
+  const announcements = database.collection("announcements");
+  const ANNOUNCE_INTERVAL_MS =
+    Number(process.env.ANNOUNCE_INTERVAL_MS) > 0 ? Number(process.env.ANNOUNCE_INTERVAL_MS) : 60 * 1000;
+  const ANNOUNCE_MAX_ATTEMPTS = 5;
+  // a claim this old belongs to a run that died between claiming and sending
+  const ANNOUNCE_CLAIM_TIMEOUT_MS = 5 * 60 * 1000;
+  const ANNOUNCE_BATCH = 50;
+  const PRICE_MESSAGES = {
+    price_decrease_scheduled: "priceDecreaseScheduled",
+    price_decrease_cancelled: "priceDecreaseCancelled",
+    price_increased: "priceIncreased",
+    price_decreased: "priceDecreased",
+  };
+
+  announcements.createIndex({sent_at: 1, created_at: 1}).catch(console.error);
+  chats.createIndex({"point_price_pending.effective_at": 1}, {sparse: true}).catch(console.error);
+
+  // No member triggers an announcement: the chat's language, else English.
+  async function chatLang(chat_id) {
+    const config = await getChatConfig(chat_id).catch(error => {
+      console.error("chat language lookup failed:", error);
+      return null;
+    });
+    return config?.lang || "en";
+  }
+
+  const isPrice = value => (typeof value === "string" && value !== "") || Number.isFinite(value);
+
+  // {text, extra} for sendMessage, or null for an unknown type or bad params.
+  function priceMessage(lang, type, params) {
+    const key = PRICE_MESSAGES[type];
+    if (!key || !isPrice(params?.from) || !isPrice(params?.to)) return null;
+    if (type !== "price_decrease_scheduled") return {text: t(lang, key, params), extra: {}};
+    if (Number.isNaN(new Date(params.effective_at ?? NaN).getTime())) return null;
+    return {
+      text: t(lang, key, params),
+      extra: {reply_markup: {inline_keyboard: [[{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}]]}},
+    };
+  }
+
+  async function drainOutbox(now) {
+    let sent = 0;
+    await announcements.updateMany(
+      {sent_at: null, claimed_at: {$lte: new Date(now.getTime() - ANNOUNCE_CLAIM_TIMEOUT_MS)}},
+      {$set: {claimed_at: null}},
+    );
+    // `$not` also matches a row without `attempts`
+    const queued = await announcements
+      .find({sent_at: null, claimed_at: null, attempts: {$not: {$gte: ANNOUNCE_MAX_ATTEMPTS}}})
+      .sort({created_at: 1})
+      .limit(ANNOUNCE_BATCH)
+      .toArray();
+
+    // after a failure the chat's later announcements wait, so it never hears
+    // them out of order (e.g. "cancelled" before "will drop")
+    const held = new Set();
+    for (const queuedRow of queued) {
+      if (held.has(queuedRow.chat_id)) continue;
+      try {
+        const row = unwrapModifyResult(
+          await announcements.findOneAndUpdate(
+            {_id: queuedRow._id, sent_at: null, claimed_at: null},
+            {$set: {claimed_at: now}},
+          ),
+        );
+        if (!row) {
+          held.add(queuedRow.chat_id); // another run took it; the chat's later ones are its to send
+          continue;
+        }
+        const where = `announcement ${row._id} (${row.type}) to chat ${row.chat_id}`;
+
+        const lang = await chatLang(row.chat_id);
+        const message = priceMessage(lang, row.type, row.params);
+        if (!message) {
+          console.error(`${where}: unknown type or malformed params, giving up`, row.params);
+          await announcements.updateOne(
+            {_id: row._id},
+            {$set: {claimed_at: null, attempts: ANNOUNCE_MAX_ATTEMPTS, last_error: "unknown type or malformed params"}},
+          );
+          continue;
+        }
+        // a decrease that already happened (the bot was down) is announced by
+        // applyDueDecreases; "will drop" for a past moment would only confuse
+        if (row.type === "price_decrease_scheduled" && new Date(row.params.effective_at) <= now) {
+          console.log(`${where}: skipped, the decrease is already due`);
+          await announcements.updateOne({_id: row._id}, {$set: {sent_at: now, skipped: "already due"}});
+          continue;
+        }
+
+        try {
+          await telegraf.telegram.sendMessage(row.chat_id, message.text, message.extra);
+        } catch (error) {
+          held.add(row.chat_id);
+          const attempts = (row.attempts || 0) + 1;
+          const giveUp = attempts >= ANNOUNCE_MAX_ATTEMPTS;
+          console.error(`${where}: attempt ${attempts} failed${giveUp ? ", giving up" : ""}:`, error?.message || error);
+          await announcements.updateOne(
+            {_id: row._id},
+            {$set: {claimed_at: null, last_error: String(error?.message || error)}, $inc: {attempts: 1}},
+          );
+          continue;
+        }
+        // if this write fails the claim expires and the chat hears it twice,
+        // which beats never
+        await announcements.updateOne({_id: row._id}, {$set: {sent_at: now}});
+        console.log(`${where}: sent`);
+        sent++;
+      } catch (error) {
+        // the claim expires and a later run retries
+        held.add(queuedRow.chat_id);
+        console.error(`announcement ${queuedRow._id} failed:`, error);
+      }
+    }
+    return sent;
+  }
+
+  // A scheduled decrease takes effect at `effective_at`. It is applied only if
+  // it is still the one read here: the mini app may have cancelled or
+  // replaced it (a new requested_at) in the meantime.
+  async function applyDueDecreases(now) {
+    let applied = 0;
+    const due = await chats
+      .find({"point_price_pending.effective_at": {$lte: now}})
+      .limit(ANNOUNCE_BATCH)
+      .toArray();
+    for (const chat of due) {
+      try {
+        const pending = chat.point_price_pending;
+        if (!pending.requested_at || !isPrice(pending.price)) {
+          console.error(`chat ${chat.id}: malformed point_price_pending, not applied`, pending);
+          continue;
+        }
+        const update = {
+          $unset: {point_price_pending: ""},
+          $push: {point_price_history: {old: pending.from, new: pending.price, at: pending.effective_at, by: pending.by}},
+        };
+        if (pending.to_default) update.$unset.point_price = "";
+        else update.$set = {point_price: pending.price};
+        const result = await chats.findOneAndUpdate(
+          {id: chat.id, "point_price_pending.requested_at": pending.requested_at},
+          update,
+        );
+        if (!unwrapModifyResult(result)) continue; // cancelled, replaced or applied meanwhile
+        applied++;
+        console.log(
+          `chat ${chat.id}: point price decreased ${pending.from} -> ${pending.price}` +
+            (pending.to_default ? " (platform default)" : ""),
+        );
+
+        const params = {from: pending.from, to: pending.price, symbol: pending.symbol ?? null};
+        const message = priceMessage(await chatLang(chat.id), "price_decreased", params);
+        if (!message) {
+          console.error(`chat ${chat.id}: price decrease not announced, malformed point_price_pending`, pending);
+          continue;
+        }
+        await telegraf.telegram
+          .sendMessage(chat.id, message.text, message.extra)
+          .catch(error => console.error(`chat ${chat.id}: price decrease announcement failed:`, error?.message || error));
+      } catch (error) {
+        console.error(`chat ${chat.id}: applying the price decrease failed:`, error);
+      }
+    }
+    return applied;
+  }
+
+  // One pass: send queued announcements, then apply due decreases. Never
+  // rejects; resolves to what it did, for logs and tests.
+  async function runAnnouncements(now = new Date()) {
+    const done = {sent: 0, applied: 0};
+    try {
+      done.sent = await drainOutbox(now);
+    } catch (error) {
+      console.error("announcement outbox failed:", error);
+    }
+    try {
+      done.applied = await applyDueDecreases(now);
+    } catch (error) {
+      console.error("applying due price decreases failed:", error);
+    }
+    return done;
+  }
+
+  let announceTimer = null;
+  let announceRun = null;
+  function startAnnouncements(intervalMs = ANNOUNCE_INTERVAL_MS) {
+    if (announceTimer) return;
+    const tick = () => {
+      if (announceRun) return; // the previous pass is still going
+      announceRun = runAnnouncements()
+        .catch(error => console.error("announcements failed:", error))
+        .finally(() => (announceRun = null));
+    };
+    announceTimer = setInterval(tick, intervalMs);
+    announceTimer.unref();
+    tick();
+  }
+  function stopAnnouncements() {
+    clearInterval(announceTimer);
+    announceTimer = null;
+  }
+  telegraf.announcements = {run: runAnnouncements, start: startAnnouncements, stop: stopAnnouncements};
 
   telegraf.catch(console.error);
 
