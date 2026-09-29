@@ -8,6 +8,7 @@ dotenv.config();
 
 const NFT_COLLECTION = "v1";
 const MINI_APP_URL = "https://t.me/achivator_bot/app";
+const ADD_TO_GROUP_URL = "https://t.me/achivator_bot?startgroup=true";
 
 // Fire-and-forget: a metrics outage must never surface as an unhandled
 // rejection (which terminates Node) or block an update handler.
@@ -529,16 +530,75 @@ export default function createBot(database, token, options) {
     await ctx.reply(t(arg, "langSet", t(arg, "languageName")));
   }
 
-  // Command menus: English by default, Russian for Russian Telegram apps. Runs
+  // ---- /start and /help ----
+  // A private chat gets a short introduction with buttons. The mini app button
+  // is a plain link to its t.me address rather than a `web_app` button: a
+  // web_app button needs the app's own HTTPS address, which lives in the mini
+  // app's BotFather settings, and the t.me link opens the same app the same
+  // way everywhere else the bot links to it.
+  //
+  // In a group the bot stays brief. Telegram's "Add to group" flow sends
+  // `/start@achivator_bot true` right after the bot joins, when it has just
+  // greeted the group (my_chat_member), so a setup hint then would repeat the
+  // greeting; for a group where the bot is already an admin the automatic
+  // /start needs no answer at all. A member who types /start or /help gets one
+  // line: the setup hint, or where the guide is.
+  const GREETING_QUIET_MS = 60 * 1000;
+  const greetedAt = new Map(); // chat_id -> ms of the last greeting
+
+  function rememberGreeting(chat_id) {
+    const now = Date.now();
+    for (const [id, at] of greetedAt) if (now - at > GREETING_QUIET_MS) greetedAt.delete(id);
+    greetedAt.set(chat_id, now);
+  }
+
+  async function handleStart(ctx) {
+    const lang = await ctx.state.lang();
+    if (ctx.chat?.type === "private") {
+      // a /start payload from a deep link carries nothing the bot acts on yet
+      await ctx.reply(t(lang, "welcome"), {
+        reply_markup: {
+          inline_keyboard: [
+            [{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}],
+            [{text: t(lang, "buttonAddToGroup"), url: ADD_TO_GROUP_URL}],
+            [{text: t(lang, "buttonSetupGuide"), url: t(lang, "setupGuideUrl")}],
+          ],
+        },
+      });
+      return;
+    }
+    if (!isGroup(ctx)) return;
+
+    const noPreview = {link_preview_options: {is_disabled: true}};
+    const me = await ctx.getChatMember(ctx.botInfo.id).catch(() => null);
+    if (me?.status === "administrator") {
+      if (ctx.command === "start" && ctx.payload) return; // automatic, from "Add to group"
+      await ctx.reply(t(lang, "startGroupReady", t(lang, "setupGuideUrl")), noPreview);
+      return;
+    }
+    if (Date.now() - (greetedAt.get(ctx.chat.id) ?? 0) < GREETING_QUIET_MS) return;
+    await ctx.reply(t(lang, "startGroupSetup", t(lang, "setupGuideUrl")), noPreview);
+  }
+
+  // Command menus: English by default, Russian for Russian Telegram apps; a
+  // private chat lists /start and /help, groups list the chat commands. Runs
   // once per bot start; a failure only leaves the old menu in place.
   for (const lang of LANGUAGES) {
-    const commands = [
-      {command: "verify", description: t(lang, "commandVerify")},
-      {command: "jetton", description: t(lang, "commandJetton")},
-      {command: "reward", description: t(lang, "commandReward")},
-      {command: "lang", description: t(lang, "commandLang")},
+    // "reward" is described by the "commandReward" text
+    const describe = command => ({
+      command,
+      description: t(lang, `command${command[0].toUpperCase()}${command.slice(1)}`),
+    });
+    const chatCommands = ["verify", "jetton", "reward", "lang"].map(describe);
+    const menus = [
+      [chatCommands, {type: "default"}],
+      [["start", "help"].map(describe), {type: "all_private_chats"}],
+      [[...chatCommands, describe("help")], {type: "all_group_chats"}],
     ];
-    telegraf.telegram.setMyCommands(commands, lang === "en" ? {} : {language_code: lang}).catch(console.error);
+    for (const [commands, scope] of menus) {
+      const extra = lang === "en" ? {scope} : {scope, language_code: lang};
+      telegraf.telegram.setMyCommands(commands, extra).catch(console.error);
+    }
   }
 
   // Every reply of an update goes out in one language, resolved on first use:
@@ -551,6 +611,7 @@ export default function createBot(database, token, options) {
 
   telegraf.command("reward", handleReward);
   telegraf.command("lang", handleLang);
+  telegraf.command(["start", "help"], handleStart);
 
   // A channel post is not a `message`, so Telegraf's command middleware never
   // sees commands typed inside a channel; dispatch them here.
@@ -612,6 +673,7 @@ export default function createBot(database, token, options) {
     // if bot was added to a new chat, announce itself and suggest granting admin rights so that it could read messages.
     // Until the chat has a language, it greets in the language of whoever added it.
     if (status === "member") {
+      rememberGreeting(ctx.chat.id);
       await ctx.reply(t(await ctx.state.lang(), "greeting"));
     }
 

@@ -203,15 +203,22 @@ const inChat = (chat, from, content) =>
   bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1, chat, from, ...content}});
 const command = text => ({text, entities: [{type: "bot_command", offset: 0, length: text.split(" ")[0].length}]});
 
-// Command menus: English by default and Russian, both with /lang.
-assert.deepEqual(commandMenus.map(menu => menu.language_code), [undefined, "ru"]);
-assert.deepEqual(commandMenus[0].commands.slice(0, 3), [
+// Command menus: English by default and Russian; private chats list /start
+// and /help, groups the chat commands (with /lang) and /help.
+assert.deepEqual(commandMenus.map(menu => `${menu.language_code ?? "en"}:${menu.scope.type}`),
+  ["en:default", "en:all_private_chats", "en:all_group_chats", "ru:default", "ru:all_private_chats", "ru:all_group_chats"]);
+const menu = (lang, type) => commandMenus.find(m => (m.language_code ?? "en") === lang && m.scope.type === type).commands;
+assert.deepEqual(menu("en", "default").slice(0, 3), [
   {command: "verify", description: "Verify creator status"},
   {command: "jetton", description: "Set the reward jetton for this chat (creators)"},
   {command: "reward", description: "Grant points to a member (admins)"},
 ]);
-assert.ok(commandMenus.every(menu => menu.commands.some(c => c.command === "lang")));
-assert.match(commandMenus[1].commands[0].description, /создатель/);
+assert.deepEqual(menu("en", "all_private_chats").map(c => c.command), ["start", "help"]);
+assert.deepEqual(menu("en", "all_group_chats").map(c => c.command), ["verify", "jetton", "reward", "lang", "help"]);
+assert.deepEqual(menu("ru", "all_group_chats").map(c => c.command), ["verify", "jetton", "reward", "lang", "help"]);
+assert.match(menu("ru", "default")[0].description, /создатель/);
+assert.equal(menu("ru", "all_private_chats")[1].description, "Инструкция по настройке");
+assert.ok(commandMenus.every(m => m.commands.every(c => c.description && !c.description.startsWith("command"))));
 
 // Until a group has a language, an announcement follows the member who triggered it.
 const MIXED = {id: -300, type: "supergroup", title: "Mixed"};
@@ -333,6 +340,63 @@ await inChat(NEW_EN, speaker(33, "en"), command(`/jetton ${MASTER}`));
 assert.equal(lastText(NEW_EN.id), "Only the chat creator can set the reward jetton.");
 await inChat(NEW_RU, speaker(32, "ru"), command(`/jetton ${MASTER}`));
 assert.match(lastText(NEW_RU.id), /^Жетон для наград задан: EQb+\n\nЧто дальше:/);
+
+// /start and /help in a private chat: an introduction with three link buttons,
+// in the user's language; a deep-link payload changes nothing.
+const lastMessage = chat_id => sent.filter(m => m.chat_id === chat_id).at(-1);
+const buttons = m => m.reply_markup.inline_keyboard.flat().map(b => `${b.text} ${b.url}`);
+await inChat(DM(41), speaker(41, "en"), command("/start"));
+assert.match(lastText(41), /^Hi! I'm Achivator, a loyalty system for Telegram chats\./);
+assert.deepEqual(buttons(lastMessage(41)), [
+  "Open the app https://t.me/achivator_bot/app",
+  "Add to a group https://t.me/achivator_bot?startgroup=true",
+  "Setup guide https://achivator.cc/en/help",
+]);
+await inChat(DM(42), speaker(42, "ru"), command("/start"));
+assert.match(lastText(42), /^Привет! Я Achivator — система лояльности для чатов в Telegram\./);
+assert.deepEqual(buttons(lastMessage(42)), [
+  "Открыть приложение https://t.me/achivator_bot/app",
+  "Добавить в группу https://t.me/achivator_bot?startgroup=true",
+  "Инструкция по настройке https://achivator.cc/ru/help",
+]);
+const before = sent.length;
+await inChat(DM(41), speaker(41, "en"), command("/start some-unknown-payload"));
+await inChat(DM(42), speaker(42, "ru"), command("/help"));
+assert.equal(sent.length, before + 2);
+assert.match(lastText(41), /^Hi! I'm Achivator/);
+assert.match(lastText(42), /^Привет! Я Achivator —/);
+
+// In a group: "Add to group" greets (my_chat_member) and then sends
+// /start@achivator_bot true, which must not repeat the greeting.
+const ADDED = {id: -700, type: "supergroup", title: "Added"};
+const inAdded = text => inChat(ADDED, speaker(51, "en"), command(text));
+const count = () => sent.filter(m => m.chat_id === ADDED.id).length;
+await botStatus(ADDED, speaker(51, "en"), "member");
+assert.match(lastText(ADDED.id), /^Hello! I'm the Achivator Bot\./);
+await inAdded("/start@achivator_bot true");
+assert.equal(count(), 1, "no setup hint right after the greeting");
+await inAdded("/start@other_bot");
+assert.equal(count(), 1, "a command for another bot is not ours");
+// later, while the bot is still not an admin, a member's /start gets the hint
+const realNow = Date.now;
+const twoMinutesLater = async fn => { Date.now = () => realNow() + 2 * 60 * 1000; try { await fn(); } finally { Date.now = realNow; } };
+await twoMinutesLater(() => inAdded("/start"));
+assert.equal(lastText(ADDED.id),
+  "To get started, make me an admin, then the chat creator runs /verify@achivator_bot.\n" +
+  "Setup guide: https://achivator.cc/en/help");
+assert.equal(lastMessage(ADDED.id).link_preview_options?.is_disabled, true);
+// once the bot is an admin: the automatic /start stays silent, a typed one gets a pointer
+statuses.set(bot.botInfo.id, "administrator");
+const counted = count();
+await inAdded("/start@achivator_bot true");
+assert.equal(count(), counted, "automatic /start in a set-up group is silent");
+await inAdded("/start");
+assert.equal(lastText(ADDED.id), "I'm already an admin here. Setup guide: https://achivator.cc/en/help");
+await inChat(NEW_RU, speaker(32, "ru"), command("/help@achivator_bot"));
+assert.equal(lastText(NEW_RU.id), "Я уже администратор в этом чате. Инструкция по настройке: https://achivator.cc/ru/help");
+statuses.delete(bot.botInfo.id);
+await twoMinutesLater(() => inChat(NEW_RU, speaker(32, "ru"), command("/help")));
+assert.match(lastText(NEW_RU.id), /^Чтобы начать, сделайте меня администратором/);
 
 // A post on behalf of a channel has no sender: English, and no crash.
 const CHANNEL = {id: -600, type: "channel", title: "C"};

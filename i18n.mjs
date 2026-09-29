@@ -48,6 +48,22 @@ const en = {
     "Thank you for granting me admin rights! I will now be able to track messages and reactions 🙌\n" +
     "To reward members with jettons for positive reactions, the chat creator runs /jetton <jetton master address>.",
 
+  // /start and /help in a private chat, with buttons below the text
+  welcome:
+    "Hi! I'm Achivator, a loyalty system for Telegram chats.\n\n" +
+    "Members react to helpful messages, and their authors earn points. Points are claimed as the chat's " +
+    "own jetton, and along the way members unlock achievements.\n\n" +
+    "To set it up: add me to your group, make me an admin and follow the setup guide.",
+  buttonOpenApp: "Open the app",
+  buttonAddToGroup: "Add to a group",
+  buttonSetupGuide: "Setup guide",
+  setupGuideUrl: "https://achivator.cc/en/help",
+  // /start and /help in a group
+  startGroupSetup: guideUrl =>
+    "To get started, make me an admin, then the chat creator runs /verify@achivator_bot.\n" +
+    `Setup guide: ${guideUrl}`,
+  startGroupReady: guideUrl => `I'm already an admin here. Setup guide: ${guideUrl}`,
+
   cannotSeeSender:
     "I cannot see who sent this (anonymous admin or a post on behalf of the channel).\n" +
     "Post as yourself, or run the command in the linked discussion group.",
@@ -105,6 +121,8 @@ const en = {
 
   migrationCompleted: "Migration completed",
 
+  commandStart: "What Achivator is and how to set it up",
+  commandHelp: "Setup guide",
   commandVerify: "Verify creator status",
   commandJetton: "Set the reward jetton for this chat (creators)",
   commandReward: "Grant points to a member (admins)",
@@ -141,6 +159,20 @@ const ru = {
     "Спасибо за права администратора! Теперь я вижу сообщения и реакции 🙌\n" +
     "Чтобы награждать участников жетонами за положительные реакции, создатель чата выполняет " +
     "/jetton <адрес мастер-контракта жетона>.",
+
+  welcome:
+    "Привет! Я Achivator — система лояльности для чатов в Telegram.\n\n" +
+    "Участники ставят реакции на полезные сообщения, а их авторы получают баллы. Баллы можно забрать " +
+    "собственным жетоном чата, а по пути участники открывают достижения.\n\n" +
+    "Как подключить: добавьте меня в группу, сделайте администратором и следуйте инструкции по настройке.",
+  buttonOpenApp: "Открыть приложение",
+  buttonAddToGroup: "Добавить в группу",
+  buttonSetupGuide: "Инструкция по настройке",
+  setupGuideUrl: "https://achivator.cc/ru/help",
+  startGroupSetup: guideUrl =>
+    "Чтобы начать, сделайте меня администратором, затем создатель чата выполняет /verify@achivator_bot.\n" +
+    `Инструкция по настройке: ${guideUrl}`,
+  startGroupReady: guideUrl => `Я уже администратор в этом чате. Инструкция по настройке: ${guideUrl}`,
 
   cannotSeeSender:
     "Я не вижу, кто это отправил (анонимный администратор или пост от имени канала).\n" +
@@ -205,6 +237,8 @@ const ru = {
 
   migrationCompleted: "Миграция завершена",
 
+  commandStart: "Что такое Achivator и как его подключить",
+  commandHelp: "Инструкция по настройке",
   commandVerify: "Подтвердить, что вы создатель чата",
   commandJetton: "Задать жетон для наград в этом чате (создатель)",
   commandReward: "Начислить баллы участнику (администраторы)",
