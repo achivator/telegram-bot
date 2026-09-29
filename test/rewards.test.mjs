@@ -193,7 +193,9 @@ await bot.handleUpdate({update_id: ++updateId, message: {message_id: photo, date
 assert.equal(cols.get("messages").docs.filter(d => d.message_id === photo).length, 1);
 
 // ---- Languages ----
-const {t} = await import("../i18n.mjs");
+const {t, langFromCode} = await import("../i18n.mjs");
+assert.deepEqual(["ru", "ru-RU", "RU", "uk", "be", "kk", "en-US", "de", undefined, ""].map(langFromCode),
+  ["ru", "ru", "ru", "en", "en", "en", "en", "en", "en", "en"]);
 const settle = () => new Promise(resolve => setTimeout(resolve, 20));
 const lastText = chat_id => sent.filter(m => m.chat_id === chat_id).at(-1)?.text;
 const speaker = (id, language_code) => ({...user(id), language_code});
@@ -223,7 +225,7 @@ const bolded = sent.at(-1).entities.find(e => e.type === "bold");
 assert.equal(sent.at(-1).text.slice(bolded.offset, bolded.offset + bolded.length), "sticker");
 await inChat(MIXED, speaker(13, "uk"), {sticker: {file_id: "s"}});
 await settle();
-assert.match(lastText(MIXED.id), /Новое достижение/, "Ukrainian clients get Russian");
+assert.match(lastText(MIXED.id), /New achievement unlocked/, "Ukrainian clients get English");
 await inChat(MIXED, user(14), {sticker: {file_id: "s"}});
 await settle();
 assert.match(lastText(MIXED.id), /New achievement unlocked/, "no language_code means English");
@@ -283,8 +285,12 @@ await inChat(DM(21), speaker(21, "ru"), command("/reward 5"));
 assert.equal(lastText(21), "Выполните /reward в группе или канале, где я администратор.");
 await inChat(DM(22), speaker(22, "en"), command("/reward 5"));
 assert.equal(lastText(22), "Run /reward in a group or channel where I am an admin.");
-await inChat(DM(21), speaker(21, "be"), command("/lang ru"));
+await inChat(DM(21), speaker(21, "ru-RU"), command("/lang ru"));
 assert.match(lastText(21), /^В личном чате я пишу на языке вашего приложения Telegram/);
+for (const code of ["uk", "be", "kk"]) {
+  await inChat(DM(21), speaker(21, code), command("/lang ru"));
+  assert.match(lastText(21), /^In a private chat I use the language of your Telegram app/, `${code} gets English`);
+}
 
 // The bot greets a new group in the language of whoever added it; the English
 // replies quoted by the mini app setup guide keep their exact wording.

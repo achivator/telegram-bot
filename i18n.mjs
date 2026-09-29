@@ -10,15 +10,12 @@ import {fmt, bold, link} from "telegraf/format";
 
 export const LANGUAGES = ["en", "ru"];
 
-// Telegram clients in these languages get Russian: their users read it far
-// more often than English.
-const RUSSIAN_READERS = new Set(["ru", "uk", "be", "kk"]);
-
 // Maps a Telegram `language_code` ("ru", "uk", "en-US", undefined) to one of
-// LANGUAGES.
+// LANGUAGES. Only Russian Telegram apps get Russian; every other language,
+// Ukrainian, Belarusian and Kazakh included, gets English.
 export function langFromCode(code) {
   const base = String(code || "").toLowerCase().split(/[-_]/)[0];
-  return RUSSIAN_READERS.has(base) ? "ru" : "en";
+  return LANGUAGES.includes(base) ? base : "en";
 }
 
 // 1 балл, 2 балла, 5 баллов, 11 баллов, 21 балл
