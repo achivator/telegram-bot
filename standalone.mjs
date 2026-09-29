@@ -46,6 +46,8 @@ const botOptions = isProduction
 
 // Telegram leaves reactions out of the default update set: without listing
 // them here the bot never sees a reaction, so it can pay no reaction points.
+// pre_checkout_query confirms a subscription payment in Stars (the bot must
+// answer it within 10 seconds or the payment fails).
 // The list is also stored by setWebhook and replaces what was set before.
 const allowedUpdates = [
   "message",
@@ -53,6 +55,7 @@ const allowedUpdates = [
   "my_chat_member",
   "message_reaction",
   "message_reaction_count",
+  "pre_checkout_query",
 ];
 
 bot.launch({ ...botOptions, allowedUpdates });

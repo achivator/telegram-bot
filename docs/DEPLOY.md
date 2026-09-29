@@ -34,6 +34,10 @@ which pushed every commit on `main` without running the tests.
      then shows a crash loop.
    - Optional tuning: `CREATOR_MULTIPLIER`, `MIN_REACTOR_MESSAGES`,
      `PAIR_DAILY_CAP`, `RECEIVER_DAILY_CAP`, `REWARD_MAX_POINTS`.
+   - Subscriptions in Telegram Stars: `SUBSCRIPTIONS_ENABLED`, `TRIAL_DAYS`,
+     `GRACE_DAYS`, with the same values as in the mini app. The mini app's
+     `TELEGRAM_BOT_TOKEN` must be this bot's token: Telegram sends the payment
+     of an invoice to the bot that created it.
 
 ## One-time setup in GitHub
 

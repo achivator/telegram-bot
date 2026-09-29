@@ -5,6 +5,7 @@ import {mention} from "telegraf/format";
 import {LANGUAGES, langFromCode, t} from "./i18n.mjs";
 import {createDmQueue, DM_MAX_ATTEMPTS} from "./dm-queue.mjs";
 import {decimalMul, decimalSub, isPositiveDecimal} from "./decimal.mjs";
+import {parseSubscriptionPayload, serviceState, subscriptionConfig} from "./subscription.mjs";
 
 dotenv.config();
 
@@ -150,9 +151,31 @@ export default function createBot(database, token, options) {
       jetton_master: chat?.jetton_master || null,
       creator: chat?.creator ?? null,
       lang: LANGUAGES.includes(chat?.lang) ? chat.lang : null,
+      trial_started_at: chat?.trial_started_at ?? null,
+      paid_until: chat?.paid_until ?? null,
     };
     chatConfigCache.set(chat_id, {value, expiresAt: Date.now() + CHAT_CONFIG_TTL_MS});
     return value;
+  }
+
+  // ---- Subscription gate (subscription.mjs) ----
+  // Whether the chat accrues points now. A chat with a reward jetton and no
+  // trial yet starts its trial here: chats that set their jetton before
+  // subscriptions were switched on get the full trial from that moment.
+  async function chatService(chat_id, now = new Date()) {
+    const config = await getChatConfig(chat_id);
+    if (subscriptionConfig().enabled && config.jetton_master && !config.trial_started_at && !config.paid_until) {
+      await startTrial(chat_id, now);
+      chatConfigCache.delete(chat_id);
+      return serviceState(await getChatConfig(chat_id), now);
+    }
+    return serviceState(config, now);
+  }
+
+  // Never restarts a trial: only a chat without one gets it.
+  function startTrial(chat_id, now = new Date()) {
+    if (!subscriptionConfig().enabled) return Promise.resolve();
+    return chats.updateOne({id: chat_id, trial_started_at: null}, {$set: {trial_started_at: now}});
   }
 
   // ---- Languages ----
@@ -199,6 +222,8 @@ export default function createBot(database, token, options) {
   // who wrote a reacted message, and how many messages a reactor has written
   messages.createIndex({chat_id: 1, message_id: 1}).catch(console.error);
   messages.createIndex({chat_id: 1, user_id: 1}).catch(console.error);
+  // active members over the last 30 days: the mini app prices the subscription by them
+  messages.createIndex({chat_id: 1, date: 1}).catch(console.error);
   // budgets only matter for the day they count
   reactionBudget.createIndex({created_at: 1}, {expireAfterSeconds: 3 * 86400}).catch(console.error);
 
@@ -267,8 +292,11 @@ export default function createBot(database, token, options) {
       const written = config.jetton_master
         ? await messages.countDocuments({chat_id, user_id: reactor_id}, {limit: MIN_REACTOR_MESSAGES})
         : 0;
+      const service = config.jetton_master ? await chatService(chat_id) : null;
       if (!config.jetton_master) {
         noReward("no reward jetton in this chat, the creator runs /jetton <master address>");
+      } else if (!service.accrues) {
+        noReward(`subscription ${service.state}, points are paused`);
       } else if (written < MIN_REACTOR_MESSAGES) {
         noReward(`reactor has ${written}/${MIN_REACTOR_MESSAGES} messages in the chat`);
       } else {
@@ -437,6 +465,10 @@ export default function createBot(database, token, options) {
       await ctx.reply(t(lang, "rewardNoJetton"));
       return;
     }
+    if (!(await chatService(ctx.chat.id)).accrues) {
+      await ctx.reply(t(lang, "subscriptionInactive"));
+      return;
+    }
 
     const msg = ctx.message || ctx.channelPost;
     const tokens = (msg.text || "").split(/\s+/).slice(1).filter(Boolean);
@@ -528,11 +560,14 @@ export default function createBot(database, token, options) {
       return;
     }
 
+    await handOverSubscription(ctx.chat.id, ctx.from.id);
     await chats.updateOne(
       {id: ctx.chat.id},
       {$set: {jetton_master: arg, creator: ctx.from.id, title: ctx.chat.title}},
       {upsert: true},
     );
+    // points start here, and so does the free trial
+    await startTrial(ctx.chat.id);
     chatConfigCache.delete(ctx.chat.id);
 
     await ctx.reply(t(lang, "jettonSet", arg));
@@ -717,6 +752,7 @@ export default function createBot(database, token, options) {
       await ctx.reply(t(lang, "verifyNotCreator", t(lang, "memberStatus", member.status)));
       return;
     }
+    await handOverSubscription(ctx.chat.id, member.user.id);
     await chats.updateOne({id: ctx.chat.id}, {$set: {creator: member.user.id}}, {upsert: true});
     chatConfigCache.delete(ctx.chat.id);
     await ctx.reply(t(lang, "verified", t(lang, "memberStatus", member.status)));
@@ -947,6 +983,206 @@ export default function createBot(database, token, options) {
 
     next();
   });
+
+  // ---- Subscription payments (Telegram Stars) ----
+  // The mini app creates the invoice (payload "sub:<chat id>", a 30-day
+  // Stars subscription); Telegram asks the bot to confirm it
+  // (pre_checkout_query) and then reports each payment, renewals included,
+  // as a successful_payment message in the payer's private chat. Every
+  // payment is logged once in `payments`, keyed by its charge id.
+  const payments = database.collection("payments");
+  payments.createIndex({charge_id: 1}, {unique: true}).catch(console.error);
+  payments.createIndex({chat_id: 1, at: 1}).catch(console.error);
+  // chats with a reward jetton: the ones the hourly subscription pass reads
+  chats.createIndex({jetton_master: 1}, {sparse: true}).catch(console.error);
+
+  const MONTH_MS = 30 * 24 * 60 * 60 * 1000;
+  const REMIND_BEFORE_MS = 3 * 24 * 60 * 60 * 1000;
+
+  async function userLang(user_id, fallback) {
+    const doc = await users.findOne({id: user_id}).catch(() => null);
+    return LANGUAGES.includes(doc?.lang) ? doc.lang : fallback;
+  }
+
+  // Best effort: the user may never have started the bot in private.
+  async function notifyUser(user_id, key, params, fallbackLang = "en") {
+    const lang = await userLang(user_id, fallbackLang);
+    await telegraf.telegram
+      .sendMessage(user_id, t(lang, key, params), {
+        reply_markup: {inline_keyboard: [[{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}]]},
+      })
+      .catch(error => console.error(`${key} to ${user_id} failed:`, error?.message || error));
+  }
+
+  // The chat has a new creator: the previous payer's monthly renewal stops
+  // (Telegram charges whoever subscribed), what they paid stays with the chat
+  // until paid_until, and the new creator subscribes from their own account.
+  async function handOverSubscription(chat_id, newCreator) {
+    try {
+      const chat = await chats.findOne({id: chat_id});
+      const sub = chat?.subscription;
+      if (!sub?.recurring || sub.payer_id === newCreator) return;
+      await cancelRenewal(chat, "creator changed");
+      await notifyUser(sub.payer_id, "subscriptionHandedOver", {title: chat.title, until: chat.paid_until}, await chatLang(chat_id));
+    } catch (error) {
+      console.error(`chat ${chat_id}: subscription handover failed:`, error);
+    }
+  }
+
+  async function cancelRenewal(chat, reason) {
+    const sub = chat.subscription;
+    try {
+      await telegraf.telegram.callApi("editUserStarSubscription", {
+        user_id: sub.payer_id,
+        telegram_payment_charge_id: sub.charge_id,
+        is_canceled: true,
+      });
+    } catch (error) {
+      console.error(`chat ${chat.id}: cancelling the renewal of ${sub.payer_id} failed:`, error?.message || error);
+    }
+    await chats.updateOne(
+      {id: chat.id, "subscription.charge_id": sub.charge_id},
+      {$set: {"subscription.recurring": false, "subscription.cancelled_at": new Date(), "subscription.cancel_reason": reason}},
+    );
+    console.log(`chat ${chat.id}: renewal by ${sub.payer_id} cancelled (${reason})`);
+  }
+
+  telegraf.on("pre_checkout_query", async ctx => {
+    const query = ctx.preCheckoutQuery;
+    const lang = await ctx.state.lang();
+    const chat_id = parseSubscriptionPayload(query.invoice_payload);
+    if (chat_id === null || query.currency !== "XTR") {
+      await ctx.answerPreCheckoutQuery(false, t(lang, "subscriptionPayFailed"));
+      return;
+    }
+    const chat = await chats.findOne({id: chat_id});
+    // the stored creator can be stale (ownership transfer): ask Telegram
+    const member = chat?.creator === query.from.id
+      ? await ctx.telegram.getChatMember(chat_id, query.from.id).catch(() => null)
+      : null;
+    if (!chat?.jetton_master || member?.status !== "creator") {
+      console.log(`chat ${chat_id}: subscription payment by ${query.from.id} refused, not the creator`);
+      await ctx.answerPreCheckoutQuery(false, t(lang, "subscriptionNotCreator"));
+      return;
+    }
+    await ctx.answerPreCheckoutQuery(true);
+  });
+
+  telegraf.on(message("successful_payment"), async ctx => {
+    const payment = ctx.message.successful_payment;
+    const chat_id = parseSubscriptionPayload(payment.invoice_payload);
+    if (chat_id === null) return;
+    const now = new Date();
+    const expires = payment.subscription_expiration_date
+      ? new Date(payment.subscription_expiration_date * 1000)
+      : new Date(now.getTime() + MONTH_MS);
+    const record = {
+      charge_id: payment.telegram_payment_charge_id,
+      chat_id,
+      payer_id: ctx.from.id,
+      stars: payment.total_amount,
+      currency: payment.currency,
+      recurring: Boolean(payment.is_recurring),
+      first_recurring: Boolean(payment.is_first_recurring),
+      expires_at: expires,
+      at: now,
+    };
+    try {
+      await payments.insertOne(record);
+    } catch (error) {
+      if (error?.code === 11000) return; // redelivered update, already recorded
+      throw error;
+    }
+
+    const chat = await chats.findOne({id: chat_id});
+    const previous = chat?.subscription;
+    // a renewal keeps the subscription's first charge id: the one Telegram
+    // knows the subscription by when the bot cancels it
+    const sameSubscription =
+      previous && previous.payer_id === record.payer_id && previous.recurring && !record.first_recurring;
+    if (previous?.recurring && previous.payer_id !== record.payer_id) await cancelRenewal(chat, "another payer subscribed");
+    const paidUntil = new Date(Math.max(expires.getTime(), new Date(chat?.paid_until ?? 0).getTime()));
+    await chats.updateOne(
+      {id: chat_id},
+      {
+        $set: {
+          paid_until: paidUntil,
+          subscription: {
+            payer_id: record.payer_id,
+            charge_id: sameSubscription ? previous.charge_id : record.charge_id,
+            recurring: record.recurring,
+            stars: record.stars,
+            at: now,
+          },
+        },
+      },
+    );
+    chatConfigCache.delete(chat_id);
+    console.log(`chat ${chat_id}: ${record.stars} stars from ${record.payer_id}, paid until ${paidUntil.toISOString()}`);
+
+    const lang = await ctx.state.lang();
+    await ctx
+      .reply(t(lang, "subscriptionPaid", {title: chat?.title, until: paidUntil, recurring: record.recurring}))
+      .catch(console.error);
+    if (chat?.sub_stop_announced_for) {
+      await chats.updateOne({id: chat_id}, {$unset: {sub_stop_announced_for: ""}});
+      await telegraf.telegram
+        .sendMessage(chat_id, t(await chatLang(chat_id), "subscriptionResumed"))
+        .catch(error => console.error(`chat ${chat_id}: resumed announcement failed:`, error?.message || error));
+    }
+  });
+
+  // Hourly with the announcements: remind the creator three days before a
+  // trial or a non-renewing subscription ends, and tell the chat once when
+  // points stop, so nobody reacts for points in vain. Each notice is claimed
+  // for the period end it is about, so it goes out once per period.
+  async function runSubscriptions(now) {
+    if (!subscriptionConfig().enabled) return 0;
+    let notices = 0;
+    const withJetton = await chats.find({jetton_master: {$ne: null}}).toArray();
+    for (const chat of withJetton) {
+      try {
+        if (!chat.trial_started_at && !chat.paid_until) {
+          await startTrial(chat.id, now);
+          chatConfigCache.delete(chat.id);
+          continue;
+        }
+        const service = serviceState(chat, now);
+        if (!service.ends_at) continue;
+        const period = service.ends_at.toISOString();
+        const lang = await chatLang(chat.id);
+
+        const renews = service.state === "paid" && chat.subscription?.recurring;
+        const ending = (service.state === "trial" || service.state === "paid") && !renews &&
+          service.ends_at.getTime() - now.getTime() <= REMIND_BEFORE_MS;
+        if (ending && chat.creator && chat.sub_reminded_for !== period) {
+          const claimed = unwrapModifyResult(
+            await chats.findOneAndUpdate({id: chat.id, sub_reminded_for: {$ne: period}}, {$set: {sub_reminded_for: period}}),
+          );
+          if (claimed) {
+            await notifyUser(chat.creator, "subscriptionEnding", {title: chat.title, until: service.ends_at, trial: service.state === "trial"}, lang);
+            notices++;
+          }
+        }
+
+        if (service.state === "expired" && chat.sub_stop_announced_for !== period) {
+          const claimed = unwrapModifyResult(
+            await chats.findOneAndUpdate({id: chat.id, sub_stop_announced_for: {$ne: period}}, {$set: {sub_stop_announced_for: period}}),
+          );
+          if (!claimed) continue;
+          await telegraf.telegram
+            .sendMessage(chat.id, t(lang, "subscriptionStopped"))
+            .catch(error => console.error(`chat ${chat.id}: stop announcement failed:`, error?.message || error));
+          if (chat.creator) await notifyUser(chat.creator, "subscriptionEndedCreator", {title: chat.title}, lang);
+          console.log(`chat ${chat.id}: points paused, subscription ${service.state}`);
+          notices++;
+        }
+      } catch (error) {
+        console.error(`chat ${chat.id}: subscription pass failed:`, error);
+      }
+    }
+    return notices;
+  }
 
   // ---- Point price announcements ----
   // The chat creator changes the price of a point in the mini app. An increase
@@ -1318,7 +1554,7 @@ export default function createBot(database, token, options) {
   // One pass: send queued announcements, then apply due decreases. Never
   // rejects; resolves to what it did, for logs and tests.
   async function runAnnouncements(now = new Date()) {
-    const done = {sent: 0, applied: 0};
+    const done = {sent: 0, applied: 0, subscriptions: 0};
     try {
       done.sent = await drainOutbox(now);
     } catch (error) {
@@ -1329,8 +1565,20 @@ export default function createBot(database, token, options) {
     } catch (error) {
       console.error("applying due price decreases failed:", error);
     }
+    // hourly: reminders are days apart
+    if (now.getTime() - lastSubscriptionPass >= SUBSCRIPTION_PASS_MS) {
+      lastSubscriptionPass = now.getTime();
+      try {
+        done.subscriptions = await runSubscriptions(now);
+      } catch (error) {
+        console.error("subscription pass failed:", error);
+      }
+    }
     return done;
   }
+
+  const SUBSCRIPTION_PASS_MS = 60 * 60 * 1000;
+  let lastSubscriptionPass = -Infinity;
 
   let announceTimer = null;
   let announceRun = null;
@@ -1351,6 +1599,8 @@ export default function createBot(database, token, options) {
     announceTimer = null;
   }
   telegraf.announcements = {run: runAnnouncements, start: startAnnouncements, stop: stopAnnouncements};
+  // the hourly subscription pass on its own, for tests
+  telegraf.subscriptions = {run: runSubscriptions};
   // The private messages queue, on its own timer (DM_INTERVAL_MS) started by
   // standalone.mjs: `bot.dms.start()`.
   telegraf.dms = {run: dms.run, start: dms.start, stop: dms.stop, limits: dms.limits};
