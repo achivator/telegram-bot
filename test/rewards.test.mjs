@@ -8,13 +8,21 @@ const commandMenus = [];
 // chat member status by user id ("member" when unset); "error" makes the
 // lookup fail, as it does for an anonymous admin
 const statuses = new Map();
+// sendMessage to these chats fails, as it does once the bot is removed
+const failingChats = new Set();
+const sendAttempts = [];
 Telegram.prototype.callApi = async function (method, payload) {
   if (method === "getChatMember") {
     const status = statuses.get(payload.user_id) ?? "member";
     if (status === "error") throw new Error("Bad Request: user not found");
     return {status, user: {id: payload.user_id, first_name: `U${payload.user_id}`}};
   }
-  if (method === "sendMessage") { sent.push(payload); return {message_id: 1}; }
+  if (method === "sendMessage") {
+    sendAttempts.push(payload.chat_id);
+    if (failingChats.has(payload.chat_id)) throw new Error("Forbidden: bot was kicked from the group chat");
+    sent.push(payload);
+    return {message_id: 1};
+  }
   if (method === "setMyCommands") commandMenus.push(payload);
   return true;
 };
@@ -47,10 +55,21 @@ class Coll {
     }
   }
   async findOne(f) { return this.docs.find(d => matches(d, f)) ?? null; }
+  find(f) {
+    let docs = this.docs.filter(d => matches(d, f)).map(d => structuredClone(d));
+    const cursor = {
+      sort(spec) { const [[k, dir]] = Object.entries(spec); docs.sort((a, b) => (get(a, k) < get(b, k) ? -dir : get(a, k) > get(b, k) ? dir : 0)); return cursor; },
+      limit(n) { docs = docs.slice(0, n); return cursor; },
+      async toArray() { return docs; },
+    };
+    return cursor;
+  }
   async insertOne(doc) { doc._id ??= ++this.n; this.checkUnique(doc); this.docs.push(doc); return {insertedId: doc._id}; }
   apply(doc, u, inserting) {
     for (const [k, v] of Object.entries(u.$inc || {})) set(doc, k, (get(doc, k) || 0) + v);
     for (const [k, v] of Object.entries(u.$set || {})) set(doc, k, v);
+    for (const k of Object.keys(u.$unset || {})) { const ks = k.split("."); const o = get(doc, ks.slice(0, -1).join(".")) ?? (ks.length === 1 ? doc : undefined); if (o) delete o[ks.at(-1)]; }
+    for (const [k, v] of Object.entries(u.$push || {})) set(doc, k, [...(get(doc, k) || []), v]);
     if (inserting) for (const [k, v] of Object.entries(u.$setOnInsert || {})) set(doc, k, v);
   }
   async upsertOrUpdate(f, u, opts = {}) {
@@ -457,9 +476,170 @@ assert.equal(lastText(CHANNEL.id), t("en", "cannotSeeSender"));
 await postInChannel("/jetton");
 assert.equal(lastText(CHANNEL.id), "I cannot see who sent this (a post on behalf of the channel). Post as yourself to run /jetton.");
 
+// ---- Point price announcements ----
+const errors = [];
+const originalError = console.error;
+console.error = (...args) => errors.push(args.map(String).join(" "));
+const outbox = database.collection("announcements");
+const chatsColl = database.collection("chats");
+const NOW = new Date("2026-10-01T09:00:00Z");
+const minutes = n => new Date(NOW.getTime() + n * 60 * 1000);
+const queue = (chat_id, type, params, extra = {}) =>
+  outbox.insertOne({chat_id, type, params, created_at: minutes(-1), sent_at: null, claimed_at: null, attempts: 0, ...extra});
+const row = _id => cols.get("announcements").docs.find(d => d._id === _id);
+const textsTo = chat_id => sent.filter(m => m.chat_id === chat_id).map(m => m.text);
+const run = (now = NOW) => bot.announcements.run(now);
+
+// A scheduled decrease in a Russian chat: sent once, even by two overlapping
+// runs, with a button to the mini app; then the cancellation, in order.
+const PRICE_RU = {id: -800, type: "supergroup", title: "P"};
+await chatsColl.insertOne({id: PRICE_RU.id, lang: "ru", point_price: "0.5"});
+const EFFECTIVE = new Date("2026-10-05T12:00:00Z");
+const {insertedId: scheduled} = await queue(PRICE_RU.id, "price_decrease_scheduled",
+  {from: "0.5", to: "0.25", symbol: "MEME", effective_at: EFFECTIVE});
+const {insertedId: cancelled} = await queue(PRICE_RU.id, "price_decrease_cancelled",
+  {from: "0.5", to: "0.25", symbol: "MEME"}, {created_at: minutes(0)});
+const [first, second] = await Promise.all([run(), run()]);
+assert.equal(first.sent + second.sent, 2);
+assert.deepEqual(textsTo(PRICE_RU.id), [
+  "Цена балла снизится 5 октября 2026, 12:00 UTC: 1 балл = 0,5 → 0,25 MEME.\n" +
+    "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.",
+  "Запланированное снижение цены балла отменено: 1 балл по-прежнему стоит 0,5 MEME.",
+]);
+assert.deepEqual(buttons(sent.find(m => m.chat_id === PRICE_RU.id)), ["Открыть приложение https://t.me/achivator_bot/app"]);
+assert.equal(row(scheduled).sent_at.getTime(), NOW.getTime());
+assert.equal(row(cancelled).sent_at.getTime(), NOW.getTime());
+await run();
+assert.equal(textsTo(PRICE_RU.id).length, 2, "a sent announcement is never sent again");
+
+// A chat without a language hears English; a missing symbol reads "jetton".
+const PRICE_EN = {id: -801, type: "supergroup", title: "E"};
+await queue(PRICE_EN.id, "price_increased", {from: "0.25", to: "1", symbol: null, cancelled_pending: true});
+await queue(PRICE_EN.id, "price_decrease_scheduled", {from: "1", to: "0.5", symbol: "USDT", effective_at: EFFECTIVE});
+await run();
+assert.deepEqual(textsTo(PRICE_EN.id), [
+  "The price of a point has gone up: 1 point = 1 jetton (was 0.25).\nThe planned decrease is cancelled.",
+  "The price of a point will drop on 5 Oct 2026, 12:00 UTC: 1 point = 1 → 0.5 USDT.\n" +
+    "Points already earned can be claimed at the current price until then — open the mini app.",
+]);
+assert.equal(t("en", "priceIncreased", {from: "1", to: "2", symbol: "X", cancelled_pending: false}),
+  "The price of a point has gone up: 1 point = 2 X (was 1).");
+assert.equal(t("ru", "priceDecreased", {from: "1", to: "0.5", symbol: null}),
+  "Цена балла снизилась: 1 балл = 0,5 жетона (было 1).");
+
+// A failed send is retried on the next run, and the chat's later
+// announcements wait for it; after 5 failed attempts the bot gives up.
+const FLAKY = -802, GONE = -803;
+failingChats.add(FLAKY);
+const {insertedId: flaky} = await queue(FLAKY, "price_increased", {from: "1", to: "2", symbol: "X", cancelled_pending: false});
+const {insertedId: flakyLater} = await queue(FLAKY, "price_decrease_cancelled", {from: "2", to: "1", symbol: "X"},
+  {created_at: minutes(0)});
+await run();
+assert.deepEqual([row(flaky).attempts, row(flaky).claimed_at, row(flaky).sent_at], [1, null, null]);
+assert.equal(row(flakyLater).attempts, 0, "the later announcement waits");
+await run();
+assert.equal(row(flaky).attempts, 2);
+failingChats.delete(FLAKY);
+await run();
+assert.deepEqual(textsTo(FLAKY), [
+  "The price of a point has gone up: 1 point = 2 X (was 1).",
+  "The planned price decrease is cancelled: 1 point stays 2 X.",
+]);
+failingChats.add(GONE);
+const {insertedId: gone} = await queue(GONE, "price_increased", {from: "1", to: "2", symbol: "X", cancelled_pending: false});
+for (let i = 0; i < 7; i++) await run(minutes(i));
+assert.equal(sendAttempts.filter(id => id === GONE).length, 5, "gives up after 5 attempts");
+assert.equal(row(gone).attempts, 5);
+assert.equal(row(gone).sent_at, null);
+assert.ok(errors.some(line => line.includes(`to chat ${GONE}: attempt 5 failed, giving up`)));
+
+// A claim left by a run that died mid-send is taken over after 5 minutes.
+const {insertedId: stuck} = await queue(-804, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"},
+  {claimed_at: minutes(-3)});
+await run();
+assert.equal(row(stuck).sent_at, null, "a fresh claim belongs to a live run");
+await run(minutes(3));
+assert.equal(row(stuck).sent_at.getTime(), minutes(3).getTime());
+assert.equal(textsTo(-804).length, 1);
+// unknown types and malformed params are given up at once; a "will drop"
+// announcement for a moment already past is not sent
+const {insertedId: odd} = await queue(-805, "price_exploded", {from: "1", to: "2"});
+const {insertedId: late} = await queue(-805, "price_decrease_scheduled",
+  {from: "1", to: "0.5", symbol: "X", effective_at: minutes(-10)});
+await run();
+assert.equal(row(odd).attempts, 5);
+assert.ok(row(late).sent_at);
+assert.equal(textsTo(-805).length, 0);
+
+// The mini app applied a due decrease itself and queued the announcement: the
+// same text the bot sends when it applies one.
+await queue(-807, "price_decreased", {from: "0.5", to: "0.25", symbol: "MEME"});
+await chatsColl.insertOne({id: -808, lang: "ru"});
+await queue(-808, "price_decreased", {from: "1", to: "0.75", symbol: null});
+await run();
+assert.deepEqual(textsTo(-807), ["The price of a point has dropped: 1 point = 0.25 MEME (was 0.5)."]);
+assert.deepEqual(textsTo(-808), ["Цена балла снизилась: 1 балл = 0,75 жетона (было 1)."]);
+
+// A due decrease is applied once, with history and an announcement in the
+// chat's language, not before effective_at.
+const REQUESTED = new Date("2026-09-28T12:00:00Z");
+const pending = (price, extra = {}) => ({price, to_default: false, from: "0.5", symbol: "MEME",
+  effective_at: EFFECTIVE, requested_at: REQUESTED, by: CREATOR, ...extra});
+await chatsColl.updateOne({id: PRICE_RU.id}, {$set: {point_price_pending: pending("0.25")}});
+await run(new Date(EFFECTIVE.getTime() - 1));
+const priceRu = () => cols.get("chats").docs.find(d => d.id === PRICE_RU.id);
+assert.equal(priceRu().point_price, "0.5", "not before effective_at");
+assert.ok(priceRu().point_price_pending);
+const after = new Date(EFFECTIVE.getTime() + 30 * 1000);
+const applied = await Promise.all([run(after), run(after)]);
+assert.equal(applied[0].applied + applied[1].applied, 1);
+assert.equal(priceRu().point_price, "0.25");
+assert.equal(priceRu().point_price_pending, undefined);
+assert.deepEqual(priceRu().point_price_history, [{old: "0.5", new: "0.25", at: EFFECTIVE, by: CREATOR}]);
+assert.deepEqual(textsTo(PRICE_RU.id).slice(2), ["Цена балла снизилась: 1 балл = 0,25 MEME (было 0,5)."]);
+await run(minutes(60 * 24 * 10));
+assert.equal(textsTo(PRICE_RU.id).length, 3);
+
+// Back to the platform default: point_price is removed; English chat.
+await chatsColl.insertOne({id: PRICE_EN.id, point_price: "1",
+  point_price_pending: pending("0.1", {to_default: true, from: "1", symbol: null})});
+await run(after);
+const priceEn = cols.get("chats").docs.find(d => d.id === PRICE_EN.id);
+assert.ok(!("point_price" in priceEn) && !("point_price_pending" in priceEn));
+assert.deepEqual(priceEn.point_price_history, [{old: "1", new: "0.1", at: EFFECTIVE, by: CREATOR}]);
+assert.equal(textsTo(PRICE_EN.id).at(-1), "The price of a point has dropped: 1 point = 0.1 jetton (was 1).");
+
+// The mini app replaced the pending decrease after the bot read it: the one
+// read is not applied (the new one waits for its own effective_at).
+const REPLACED = -806;
+await chatsColl.insertOne({id: REPLACED, point_price: "0.5", point_price_pending: pending("0.25")});
+const realFind = cols.get("chats").find;
+cols.get("chats").find = function (f) {
+  const cursor = realFind.call(this, f);
+  const replaced = cols.get("chats").docs.find(d => d.id === REPLACED);
+  replaced.point_price_pending = pending("0.4", {requested_at: minutes(0), effective_at: minutes(60 * 24 * 7)});
+  return cursor;
+};
+const outcome = await run(after);
+cols.get("chats").find = realFind;
+assert.equal(outcome.applied, 0);
+const replaced = cols.get("chats").docs.find(d => d.id === REPLACED);
+assert.equal(replaced.point_price, "0.5");
+assert.equal(replaced.point_price_pending.price, "0.4");
+assert.equal(replaced.point_price_history, undefined);
+assert.equal(textsTo(REPLACED).length, 0);
+// The timer runs a pass at once and stops cleanly.
+const queuedBefore = sent.length;
+await queue(-809, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"});
+bot.announcements.start(60 * 60 * 1000);
+bot.announcements.start(60 * 60 * 1000); // a second start is a no-op
+await settle();
+bot.announcements.stop();
+assert.equal(sent.length, queuedBefore + 1);
+console.error = originalError;
+
 // A missing key falls back to English, an unknown key does not throw.
 assert.equal(t("de", "jettonWhere"), "Run this command in a group or channel.");
-const originalError = console.error;
 console.error = () => {};
 assert.equal(t("ru", "noSuchKey"), "noSuchKey");
 console.error = originalError;

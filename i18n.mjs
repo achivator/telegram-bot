@@ -27,6 +27,25 @@ function ruPlural(n, one, few, many) {
   return many;
 }
 
+// Point price announcements show the moment of a change explicitly in UTC:
+// "5 Oct 2026, 12:00 UTC", "5 октября 2026, 12:00 UTC".
+const EN_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const RU_MONTHS = [
+  "января", "февраля", "марта", "апреля", "мая", "июня",
+  "июля", "августа", "сентября", "октября", "ноября", "декабря",
+];
+
+function utcDateTime(value, months) {
+  const date = new Date(value);
+  const time = date.toISOString().slice(11, 16);
+  return `${date.getUTCDate()} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()}, ${time} UTC`;
+}
+
+// Prices arrive as canonical decimal strings ("0.25"); Russian writes "0,25".
+function ruDecimal(value) {
+  return String(value).replace(".", ",");
+}
+
 const en = {
   languageName: "English",
   member: "member",
@@ -122,6 +141,20 @@ const en = {
     "To set the language of a group, run /lang ru or /lang en there (creator and admins).",
 
   migrationCompleted: "Migration completed",
+
+  // Point price changes made in the mini app. `symbol` is the reward jetton's
+  // symbol, null when unknown.
+  priceDecreaseScheduled: ({from, to, symbol, effective_at}) =>
+    `The price of a point will drop on ${utcDateTime(effective_at, EN_MONTHS)}: ` +
+    `1 point = ${from} → ${to} ${symbol || "jetton"}.\n` +
+    "Points already earned can be claimed at the current price until then — open the mini app.",
+  priceDecreased: ({from, to, symbol}) =>
+    `The price of a point has dropped: 1 point = ${to} ${symbol || "jetton"} (was ${from}).`,
+  priceIncreased: ({from, to, symbol, cancelled_pending}) =>
+    `The price of a point has gone up: 1 point = ${to} ${symbol || "jetton"} (was ${from}).` +
+    (cancelled_pending ? "\nThe planned decrease is cancelled." : ""),
+  priceDecreaseCancelled: ({from, symbol}) =>
+    `The planned price decrease is cancelled: 1 point stays ${from} ${symbol || "jetton"}.`,
 
   commandStart: "What Achivator is and how to set it up",
   commandHelp: "Setup guide",
@@ -240,6 +273,18 @@ const ru = {
     "Чтобы задать язык группы, выполните там /lang ru или /lang en (создатель и администраторы).",
 
   migrationCompleted: "Миграция завершена",
+
+  priceDecreaseScheduled: ({from, to, symbol, effective_at}) =>
+    `Цена балла снизится ${utcDateTime(effective_at, RU_MONTHS)}: ` +
+    `1 балл = ${ruDecimal(from)} → ${ruDecimal(to)} ${symbol || "жетона"}.\n` +
+    "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.",
+  priceDecreased: ({from, to, symbol}) =>
+    `Цена балла снизилась: 1 балл = ${ruDecimal(to)} ${symbol || "жетона"} (было ${ruDecimal(from)}).`,
+  priceIncreased: ({from, to, symbol, cancelled_pending}) =>
+    `Цена балла выросла: 1 балл = ${ruDecimal(to)} ${symbol || "жетона"} (было ${ruDecimal(from)}).` +
+    (cancelled_pending ? "\nЗапланированное снижение отменено." : ""),
+  priceDecreaseCancelled: ({from, symbol}) =>
+    `Запланированное снижение цены балла отменено: 1 балл по-прежнему стоит ${ruDecimal(from)} ${symbol || "жетона"}.`,
 
   commandStart: "Что такое Achivator и как его подключить",
   commandHelp: "Инструкция по настройке",

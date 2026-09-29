@@ -934,6 +934,228 @@ export default function createBot(database, token, options) {
     next();
   });
 
+  // ---- Point price announcements ----
+  // The chat creator changes the price of a point in the mini app. An increase
+  // applies at once; a decrease is scheduled (chats.point_price_pending) so
+  // members can still claim at the old price. The mini app queues what the
+  // chat should hear in the `announcements` outbox:
+  //   {chat_id, type, params, created_at, sent_at: null, claimed_at: null, attempts: 0}
+  // with type "price_decrease_scheduled" {from, to, symbol, effective_at},
+  // "price_decrease_cancelled" {from, to, symbol}, "price_increased"
+  // {from, to, symbol, cancelled_pending} or "price_decreased" {from, to,
+  // symbol}. The bot sends those, applies decreases that are due and
+  // announces them itself; the mini app queues "price_decreased" only when it
+  // applied a due decrease before the bot did (a new price saved after
+  // effective_at). Prices are decimal
+  // strings; a chat without point_price uses the platform default, which the
+  // bot does not know. The bot caches nothing price-related (getChatConfig),
+  // so an applied decrease invalidates no cache.
+  //
+  // Every step claims its work atomically, so overlapping runs (a slow tick,
+  // a second process) never send an announcement or apply a decrease twice.
+  // Runs on a timer started by standalone.mjs: `bot.announcements.start()`.
+  const announcements = database.collection("announcements");
+  const ANNOUNCE_INTERVAL_MS =
+    Number(process.env.ANNOUNCE_INTERVAL_MS) > 0 ? Number(process.env.ANNOUNCE_INTERVAL_MS) : 60 * 1000;
+  const ANNOUNCE_MAX_ATTEMPTS = 5;
+  // a claim this old belongs to a run that died between claiming and sending
+  const ANNOUNCE_CLAIM_TIMEOUT_MS = 5 * 60 * 1000;
+  const ANNOUNCE_BATCH = 50;
+  const PRICE_MESSAGES = {
+    price_decrease_scheduled: "priceDecreaseScheduled",
+    price_decrease_cancelled: "priceDecreaseCancelled",
+    price_increased: "priceIncreased",
+    price_decreased: "priceDecreased",
+  };
+
+  announcements.createIndex({sent_at: 1, created_at: 1}).catch(console.error);
+  chats.createIndex({"point_price_pending.effective_at": 1}, {sparse: true}).catch(console.error);
+
+  // No member triggers an announcement: the chat's language, else English.
+  async function chatLang(chat_id) {
+    const config = await getChatConfig(chat_id).catch(error => {
+      console.error("chat language lookup failed:", error);
+      return null;
+    });
+    return config?.lang || "en";
+  }
+
+  const isPrice = value => (typeof value === "string" && value !== "") || Number.isFinite(value);
+
+  // {text, extra} for sendMessage, or null for an unknown type or bad params.
+  function priceMessage(lang, type, params) {
+    const key = PRICE_MESSAGES[type];
+    if (!key || !isPrice(params?.from) || !isPrice(params?.to)) return null;
+    if (type !== "price_decrease_scheduled") return {text: t(lang, key, params), extra: {}};
+    if (Number.isNaN(new Date(params.effective_at ?? NaN).getTime())) return null;
+    return {
+      text: t(lang, key, params),
+      extra: {reply_markup: {inline_keyboard: [[{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}]]}},
+    };
+  }
+
+  async function drainOutbox(now) {
+    let sent = 0;
+    await announcements.updateMany(
+      {sent_at: null, claimed_at: {$lte: new Date(now.getTime() - ANNOUNCE_CLAIM_TIMEOUT_MS)}},
+      {$set: {claimed_at: null}},
+    );
+    // `$not` also matches a row without `attempts`
+    const queued = await announcements
+      .find({sent_at: null, claimed_at: null, attempts: {$not: {$gte: ANNOUNCE_MAX_ATTEMPTS}}})
+      .sort({created_at: 1})
+      .limit(ANNOUNCE_BATCH)
+      .toArray();
+
+    // after a failure the chat's later announcements wait, so it never hears
+    // them out of order (e.g. "cancelled" before "will drop")
+    const held = new Set();
+    for (const queuedRow of queued) {
+      if (held.has(queuedRow.chat_id)) continue;
+      try {
+        const row = unwrapModifyResult(
+          await announcements.findOneAndUpdate(
+            {_id: queuedRow._id, sent_at: null, claimed_at: null},
+            {$set: {claimed_at: now}},
+          ),
+        );
+        if (!row) {
+          held.add(queuedRow.chat_id); // another run took it; the chat's later ones are its to send
+          continue;
+        }
+        const where = `announcement ${row._id} (${row.type}) to chat ${row.chat_id}`;
+
+        const lang = await chatLang(row.chat_id);
+        const message = priceMessage(lang, row.type, row.params);
+        if (!message) {
+          console.error(`${where}: unknown type or malformed params, giving up`, row.params);
+          await announcements.updateOne(
+            {_id: row._id},
+            {$set: {claimed_at: null, attempts: ANNOUNCE_MAX_ATTEMPTS, last_error: "unknown type or malformed params"}},
+          );
+          continue;
+        }
+        // a decrease that already happened (the bot was down) is announced by
+        // applyDueDecreases; "will drop" for a past moment would only confuse
+        if (row.type === "price_decrease_scheduled" && new Date(row.params.effective_at) <= now) {
+          console.log(`${where}: skipped, the decrease is already due`);
+          await announcements.updateOne({_id: row._id}, {$set: {sent_at: now, skipped: "already due"}});
+          continue;
+        }
+
+        try {
+          await telegraf.telegram.sendMessage(row.chat_id, message.text, message.extra);
+        } catch (error) {
+          held.add(row.chat_id);
+          const attempts = (row.attempts || 0) + 1;
+          const giveUp = attempts >= ANNOUNCE_MAX_ATTEMPTS;
+          console.error(`${where}: attempt ${attempts} failed${giveUp ? ", giving up" : ""}:`, error?.message || error);
+          await announcements.updateOne(
+            {_id: row._id},
+            {$set: {claimed_at: null, last_error: String(error?.message || error)}, $inc: {attempts: 1}},
+          );
+          continue;
+        }
+        // if this write fails the claim expires and the chat hears it twice,
+        // which beats never
+        await announcements.updateOne({_id: row._id}, {$set: {sent_at: now}});
+        console.log(`${where}: sent`);
+        sent++;
+      } catch (error) {
+        // the claim expires and a later run retries
+        held.add(queuedRow.chat_id);
+        console.error(`announcement ${queuedRow._id} failed:`, error);
+      }
+    }
+    return sent;
+  }
+
+  // A scheduled decrease takes effect at `effective_at`. It is applied only if
+  // it is still the one read here: the mini app may have cancelled or
+  // replaced it (a new requested_at) in the meantime.
+  async function applyDueDecreases(now) {
+    let applied = 0;
+    const due = await chats
+      .find({"point_price_pending.effective_at": {$lte: now}})
+      .limit(ANNOUNCE_BATCH)
+      .toArray();
+    for (const chat of due) {
+      try {
+        const pending = chat.point_price_pending;
+        if (!pending.requested_at || !isPrice(pending.price)) {
+          console.error(`chat ${chat.id}: malformed point_price_pending, not applied`, pending);
+          continue;
+        }
+        const update = {
+          $unset: {point_price_pending: ""},
+          $push: {point_price_history: {old: pending.from, new: pending.price, at: pending.effective_at, by: pending.by}},
+        };
+        if (pending.to_default) update.$unset.point_price = "";
+        else update.$set = {point_price: pending.price};
+        const result = await chats.findOneAndUpdate(
+          {id: chat.id, "point_price_pending.requested_at": pending.requested_at},
+          update,
+        );
+        if (!unwrapModifyResult(result)) continue; // cancelled, replaced or applied meanwhile
+        applied++;
+        console.log(
+          `chat ${chat.id}: point price decreased ${pending.from} -> ${pending.price}` +
+            (pending.to_default ? " (platform default)" : ""),
+        );
+
+        const params = {from: pending.from, to: pending.price, symbol: pending.symbol ?? null};
+        const message = priceMessage(await chatLang(chat.id), "price_decreased", params);
+        if (!message) {
+          console.error(`chat ${chat.id}: price decrease not announced, malformed point_price_pending`, pending);
+          continue;
+        }
+        await telegraf.telegram
+          .sendMessage(chat.id, message.text, message.extra)
+          .catch(error => console.error(`chat ${chat.id}: price decrease announcement failed:`, error?.message || error));
+      } catch (error) {
+        console.error(`chat ${chat.id}: applying the price decrease failed:`, error);
+      }
+    }
+    return applied;
+  }
+
+  // One pass: send queued announcements, then apply due decreases. Never
+  // rejects; resolves to what it did, for logs and tests.
+  async function runAnnouncements(now = new Date()) {
+    const done = {sent: 0, applied: 0};
+    try {
+      done.sent = await drainOutbox(now);
+    } catch (error) {
+      console.error("announcement outbox failed:", error);
+    }
+    try {
+      done.applied = await applyDueDecreases(now);
+    } catch (error) {
+      console.error("applying due price decreases failed:", error);
+    }
+    return done;
+  }
+
+  let announceTimer = null;
+  let announceRun = null;
+  function startAnnouncements(intervalMs = ANNOUNCE_INTERVAL_MS) {
+    if (announceTimer) return;
+    const tick = () => {
+      if (announceRun) return; // the previous pass is still going
+      announceRun = runAnnouncements()
+        .catch(error => console.error("announcements failed:", error))
+        .finally(() => (announceRun = null));
+    };
+    announceTimer = setInterval(tick, intervalMs);
+    announceTimer.unref();
+    tick();
+  }
+  function stopAnnouncements() {
+    clearInterval(announceTimer);
+    announceTimer = null;
+  }
+  telegraf.announcements = {run: runAnnouncements, start: startAnnouncements, stop: stopAnnouncements};
+
   telegraf.catch(console.error);
 
   return telegraf;
