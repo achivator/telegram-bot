@@ -119,6 +119,7 @@ export default function createBot(database, token, options) {
   const chats = database.collection("chats");
   const rewards = database.collection("rewards");
   const grants = database.collection("grants");
+  const users = database.collection("users");
 
   // ---- Jetton rewards ----
   // A chat rewards its members with jetton points once the creator has set a
@@ -316,6 +317,49 @@ export default function createBot(database, token, options) {
     );
   }
 
+  // ---- Known users ----
+  // Telegram's Bot API cannot look a user up by @username, so the bot keeps
+  // the usernames of the people it sees (messages, reactions, commands) to
+  // resolve `/reward @username`. A username belongs to one account at a time:
+  // whoever had it before is cleared when someone else shows up with it.
+  const USER_REFRESH_MS = 24 * 60 * 60 * 1000;
+  const MAX_CACHED_USERS = 50000;
+  // user id -> {key, at}: skips the write while name and username are unchanged
+  const seenUsers = new Map();
+
+  users.createIndex({id: 1}, {unique: true}).catch(console.error);
+  users.createIndex({username: 1}).catch(console.error);
+
+  async function rememberUser(user) {
+    const username = user.username ? user.username.toLowerCase() : null;
+    const key = `${username}|${user.first_name || ""}`;
+    const cached = seenUsers.get(user.id);
+    if (cached?.key === key && Date.now() - cached.at < USER_REFRESH_MS) return;
+
+    await users.updateOne(
+      {id: user.id},
+      {$set: {username, first_name: user.first_name || null, updated_at: new Date()}},
+      {upsert: true},
+    );
+    if (username && cached?.key !== key) {
+      await users.updateMany({username, id: {$ne: user.id}}, {$set: {username: null}});
+    }
+    if (seenUsers.size >= MAX_CACHED_USERS) seenUsers.clear();
+    seenUsers.set(user.id, {key, at: Date.now()});
+  }
+
+  // The member of this chat who goes by `@username` (any case), or why not.
+  const MEMBER_STATUSES = new Set(["creator", "administrator", "member", "restricted"]);
+  async function findMemberByUsername(ctx, username) {
+    const known = await users.findOne({username: username.toLowerCase()});
+    if (!known) return {error: "rewardUnknownUsername"};
+    const member = await ctx.telegram.getChatMember(ctx.chat.id, known.id).catch(() => null);
+    if (!member?.user || !MEMBER_STATUSES.has(member.status) || member.is_member === false) {
+      return {error: "rewardCannotResolve"};
+    }
+    return {user: member.user};
+  }
+
   // ---- Manual grants ----
   // Points also appear without a reaction: an admin (a human or another bot
   // with Bot-to-Bot Communication Mode, e.g. a channel publisher that knows who
@@ -407,9 +451,9 @@ export default function createBot(database, token, options) {
       const first = tokens[0];
       args = tokens.slice(1);
       if (first?.startsWith("@")) {
-        const found = await ctx.telegram.getChatMember(ctx.chat.id, first.slice(1)).catch(() => null);
-        if (!found?.user) {
-          await ctx.reply(t(lang, "rewardCannotResolve", first));
+        const found = await findMemberByUsername(ctx, first.slice(1));
+        if (found.error) {
+          await ctx.reply(t(lang, found.error, first));
           return;
         }
         target = {id: found.user.id, name: found.user.first_name || first.slice(1)};
@@ -609,6 +653,15 @@ export default function createBot(database, token, options) {
     return next();
   });
 
+  // Bots (including anonymous admins and channel posts) have no username to
+  // reward by. A failed write only costs a later `/reward @username`.
+  telegraf.use(async (ctx, next) => {
+    if (ctx.from && !ctx.from.is_bot) {
+      await rememberUser(ctx.from).catch(error => console.error("remembering user failed:", error));
+    }
+    return next();
+  });
+
   telegraf.command("reward", handleReward);
   telegraf.command("lang", handleLang);
   telegraf.command(["start", "help"], handleStart);
@@ -672,7 +725,8 @@ export default function createBot(database, token, options) {
 
     // if bot was added to a new chat, announce itself and suggest granting admin rights so that it could read messages.
     // Until the chat has a language, it greets in the language of whoever added it.
-    if (status === "member") {
+    // In a private chat "member" means the user unblocked the bot: nothing to say.
+    if (status === "member" && isGroup(ctx)) {
       rememberGreeting(ctx.chat.id);
       await ctx.reply(t(await ctx.state.lang(), "greeting"));
     }

@@ -21,8 +21,20 @@ Telegram.prototype.callApi = async function (method, payload) {
 
 const get = (doc, path) => path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), doc);
 const set = (doc, path, v) => { const ks = path.split("."); let o = doc; for (const k of ks.slice(0, -1)) o = o[k] ??= {}; o[ks.at(-1)] = v; };
-const matches = (doc, filter) => Object.entries(filter).every(([k, v]) =>
-  v && typeof v === "object" && "$lte" in v ? get(doc, k) <= v.$lte : get(doc, k) === v);
+// Mongo semantics the bot relies on: null matches a missing field, dates
+// compare by value, comparisons never match a missing field.
+const same = (a, b) => (a instanceof Date && b instanceof Date ? a.getTime() === b.getTime() : a === b);
+const OPS = {
+  $lt: (x, v) => x != null && x < v,
+  $lte: (x, v) => x != null && x <= v,
+  $gte: (x, v) => x != null && x >= v,
+  $ne: (x, v) => !same(x ?? null, v),
+  $not: (x, v) => !test(x, v),
+};
+const isOps = v => v && typeof v === "object" && !(v instanceof Date) && Object.keys(v).every(k => k in OPS);
+const test = (x, v) =>
+  isOps(v) ? Object.entries(v).every(([op, arg]) => OPS[op](x, arg)) : v === null ? x == null : same(x, v);
+const matches = (doc, filter) => Object.entries(filter).every(([k, v]) => test(get(doc, k), v));
 const dup = () => Object.assign(new Error("E11000"), {code: 11000});
 
 class Coll {
@@ -52,6 +64,7 @@ class Coll {
     return doc;
   }
   async updateOne(f, u, opts) { await this.upsertOrUpdate(f, u, opts); return {}; }
+  async updateMany(f, u) { const hit = this.docs.filter(d => matches(d, f)); for (const d of hit) this.apply(d, u, false); return {modifiedCount: hit.length}; }
   async findOneAndUpdate(f, u, opts) { return {value: structuredClone(await this.upsertOrUpdate(f, u, opts))}; }
   async findOneAndDelete(f) { const i = this.docs.findIndex(d => matches(d, f)); return {value: i < 0 ? null : this.docs.splice(i, 1)[0]}; }
   async countDocuments(f, {limit} = {}) { const n = this.docs.filter(d => matches(d, f)).length; return limit ? Math.min(n, limit) : n; }
@@ -284,6 +297,33 @@ assert.deepEqual([1, 2, 5, 11, 21, 22, 112].map(n => t("ru", "rewardGranted", n,
   ["X: +1 балл", "X: +2 балла", "X: +5 баллов", "X: +11 баллов", "X: +21 балл", "X: +22 балла", "X: +112 баллов"]);
 assert.equal(t("en", "rewardGranted", 5, "U3", null),
   "+5 points to U3\nThey can claim them as jetton in the mini app once they mature.");
+
+// /reward @username: resolved through the users the bot has seen, any case,
+// and only while they are members of the chat.
+const MEME_LORD = {id: 61, is_bot: false, first_name: "Meme", username: "MemeLord"};
+await send(MEME_LORD, {text: "a meme"});
+await send(user(CREATOR), command("/reward @memelord 7 мем"));
+assert.equal(lastText(CHAT.id), "U61: +7 баллов — мем\nИх можно будет забрать жетонами в мини-приложении, когда пройдёт срок созревания.");
+assert.equal(points(61), 7);
+assert.deepEqual(
+  (({id, username, first_name}) => ({id, username, first_name}))(await database.collection("users").findOne({id: 61})),
+  {id: 61, username: "memelord", first_name: "Meme"});
+await send(user(CREATOR), command("/reward @nobody_here 3"));
+assert.equal(lastText(CHAT.id), "Я ещё не видел @nobody_here в этом чате — ответьте на его сообщение: /reward <баллы> [причина]");
+assert.equal(t("en", "rewardUnknownUsername", "@x"),
+  "I haven't seen @x in this chat yet — reply to their message instead: /reward <points> [reason]");
+await react({id: 62, is_bot: false, first_name: "Gone", username: "gone"}, photo, [], ["🤡"]);
+statuses.set(62, "left");
+await send(user(CREATOR), command("/reward @Gone 3"));
+assert.equal(lastText(CHAT.id), "Не могу найти @Gone: пользователь должен быть участником этого чата.");
+assert.equal(points(62), 0);
+statuses.delete(62);
+// the username moves to another account: it now resolves to the new owner
+await send({id: 63, is_bot: false, first_name: "Heir", username: "memelord"}, {text: "mine now"});
+await send(user(CREATOR), command("/reward @MemeLord 2"));
+assert.equal(points(63), 2);
+assert.equal(points(61), 7);
+assert.equal((await database.collection("users").findOne({id: 61})).username, null);
 statuses.delete(CREATOR);
 
 // Private chats follow the user's Telegram app.
@@ -397,6 +437,13 @@ assert.equal(lastText(NEW_RU.id), "Я уже администратор в эт�
 statuses.delete(bot.botInfo.id);
 await twoMinutesLater(() => inChat(NEW_RU, speaker(32, "ru"), command("/help")));
 assert.match(lastText(NEW_RU.id), /^Чтобы начать, сделайте меня администратором/);
+
+// Blocking and unblocking the bot in a private chat is a my_chat_member update
+// too, but there is no group to greet.
+const beforeUnblock = sent.length;
+await botStatus(DM(71), speaker(71, "en"), "kicked");
+await botStatus(DM(71), speaker(71, "en"), "member");
+assert.equal(sent.length, beforeUnblock, "no greeting in a private chat");
 
 // A post on behalf of a channel has no sender: English, and no crash.
 const CHANNEL = {id: -600, type: "channel", title: "C"};

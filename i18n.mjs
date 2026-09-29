@@ -75,6 +75,8 @@ const en = {
     "That message has no author I can reward (a bot or an anonymous channel post).\n" +
     "Grant by id instead: /reward <user id> <points> [reason]",
   rewardCannotResolve: username => `I cannot resolve ${username}: they must be a member of this chat.`,
+  rewardUnknownUsername: username =>
+    `I haven't seen ${username} in this chat yet — reply to their message instead: /reward <points> [reason]`,
   rewardUsage: maxPoints =>
     "Grant points to a member:\n" +
     "• as a reply: /reward <points> [reason]\n" +
@@ -188,6 +190,8 @@ const ru = {
     "У этого сообщения нет автора, которого можно наградить (бот или анонимный пост канала).\n" +
     "Начислите по id: /reward <id пользователя> <баллы> [причина]",
   rewardCannotResolve: username => `Не могу найти ${username}: пользователь должен быть участником этого чата.`,
+  rewardUnknownUsername: username =>
+    `Я ещё не видел ${username} в этом чате — ответьте на его сообщение: /reward <баллы> [причина]`,
   rewardUsage: maxPoints =>
     "Начислить баллы участнику:\n" +
     "• ответом на его сообщение: /reward <баллы> [причина]\n" +
