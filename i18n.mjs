@@ -180,6 +180,32 @@ const en = {
     `In ${chat_title || "one of your chats"}, the planned price drop is cancelled; ` +
     `1 point stays ${from} ${symbol || "jetton"}.`,
 
+  // Service subscription (Telegram Stars). Claiming points already earned
+  // never depends on it. `title` is the chat title, `until` a date.
+  subscriptionInactive:
+    "Points are paused in this chat: the Achivator subscription is not paid. " +
+    "Points already earned can still be claimed. The creator can renew it in the mini app.",
+  subscriptionStopped:
+    "Achivator no longer counts points in this chat: the subscription has ended. " +
+    "Reactions earn nothing until the creator renews it in the mini app. " +
+    "Points already earned can be claimed as usual.",
+  subscriptionResumed: "Achivator counts points in this chat again: the subscription is paid. Thank you!",
+  subscriptionEnding: ({title, until, trial}) =>
+    `${trial ? "The free trial" : "The Achivator subscription"} of ${title || "your chat"} ends on ${utcDateTime(until, EN_MONTHS)}. ` +
+    "After that and a few days of grace, reactions stop earning points (points already earned stay claimable). " +
+    "Subscribe in the mini app to keep the rewards going.",
+  subscriptionEndedCreator: ({title}) =>
+    `The Achivator subscription of ${title || "your chat"} has ended: reactions no longer earn points there. ` +
+    "Members can still claim what they earned. Renew it in the mini app whenever you like.",
+  subscriptionPaid: ({title, until, recurring}) =>
+    `Thank you! Points in ${title || "your chat"} are paid until ${utcDateTime(until, EN_MONTHS)}` +
+    (recurring ? " and renew every month." : "."),
+  subscriptionHandedOver: ({title, until}) =>
+    `You are no longer the creator of ${title || "a chat"}, so its Achivator subscription will not renew from your account. ` +
+    `What you paid stays with the chat until ${utcDateTime(until, EN_MONTHS)}.`,
+  subscriptionNotCreator: "Only the current creator of the chat can pay for its subscription.",
+  subscriptionPayFailed: "This payment is not for an Achivator chat subscription.",
+
   commandStart: "What Achivator is and how to set it up",
   commandHelp: "Setup guide",
   commandVerify: "Verify creator status",
@@ -320,6 +346,31 @@ const ru = {
   dmPriceDecreaseCancelled: ({chat_title, from, symbol}) =>
     `${ruInChat(chat_title)} запланированное снижение цены балла отменено: ` +
     `1 балл по-прежнему стоит ${ruDecimal(from)} ${symbol || "жетона"}.`,
+
+  subscriptionInactive:
+    "Начисление баллов в этом чате приостановлено: подписка Achivator не оплачена. " +
+    "Уже заработанные баллы можно забрать. Продлить подписку может создатель чата в мини-приложении.",
+  subscriptionStopped:
+    "Achivator больше не начисляет баллы в этом чате: подписка закончилась. " +
+    "Реакции ничего не приносят, пока создатель не продлит её в мини-приложении. " +
+    "Уже заработанные баллы можно забрать как обычно.",
+  subscriptionResumed: "Achivator снова начисляет баллы в этом чате: подписка оплачена. Спасибо!",
+  subscriptionEnding: ({title, until, trial}) =>
+    `${trial ? "Пробный период" : "Подписка Achivator"} ${title ? `чата «${title}»` : "вашего чата"} ` +
+    `закончится ${utcDateTime(until, RU_MONTHS)}. ` +
+    "После этого и нескольких дней отсрочки реакции перестанут приносить баллы (заработанные баллы останутся доступны). " +
+    "Оформите подписку в мини-приложении, чтобы награды не прерывались.",
+  subscriptionEndedCreator: ({title}) =>
+    `Подписка Achivator ${title ? `чата «${title}»` : "вашего чата"} закончилась: реакции там больше не приносят баллы. ` +
+    "Участники по-прежнему могут забрать заработанное. Продлить подписку можно в мини-приложении в любой момент.",
+  subscriptionPaid: ({title, until, recurring}) =>
+    `Спасибо! Баллы ${title ? `в чате «${title}»` : "в вашем чате"} оплачены до ${utcDateTime(until, RU_MONTHS)}` +
+    (recurring ? " и продлеваются каждый месяц." : "."),
+  subscriptionHandedOver: ({title, until}) =>
+    `Вы больше не создатель ${title ? `чата «${title}»` : "чата"}, поэтому его подписка Achivator больше не будет продлеваться с вашего аккаунта. ` +
+    `Оплаченное остаётся за чатом до ${utcDateTime(until, RU_MONTHS)}.`,
+  subscriptionNotCreator: "Оплатить подписку чата может только его текущий создатель.",
+  subscriptionPayFailed: "Этот платёж не относится к подписке Achivator.",
 
   commandStart: "Что такое Achivator и как его подключить",
   commandHelp: "Инструкция по настройке",

@@ -926,6 +926,127 @@ console.error = () => {};
 assert.equal(t("ru", "noSuchKey"), "noSuchKey");
 console.error = originalError;
 
+// ---- Subscription (Telegram Stars) ----
+// Off by default: every test above ran with it off. Switched on, a chat's
+// trial starts with /jetton, points stop after the trial and the grace days,
+// a payment by the creator resumes them, claims never depend on it.
+process.env.SUBSCRIPTIONS_ENABLED = "true";
+const apiCalls = [];
+const plainCallApi = Telegram.prototype.callApi;
+Telegram.prototype.callApi = async function (method, payload) {
+  apiCalls.push({method, payload});
+  return plainCallApi.call(this, method, payload);
+};
+const callsOf = method => apiCalls.filter(c => c.method === method).map(c => c.payload);
+const DAY = 24 * 60 * 60 * 1000;
+const SUB = {id: -600, type: "supergroup", title: "Paid Club"};
+const SUB_OWNER = 6001, SUB_FAN = 6002, SUB_WRITER = 6003, SUB_HEIR = 6004;
+statuses.set(SUB_OWNER, "creator");
+const subChat = () => chatsColl.docs.find(d => d.id === SUB.id);
+const subPoints = id => cols.get("rewards").docs.find(d => d.chat_id === SUB.id && d.user_id === id)?.points ?? 0;
+const subReact = async () => {
+  const message_id = ++msgId;
+  await bot.handleUpdate({update_id: ++updateId, message: {message_id, date: 1, chat: SUB, from: user(SUB_WRITER), text: "take this"}});
+  await bot.handleUpdate({update_id: ++updateId, message_reaction: {chat: SUB, message_id, user: user(SUB_FAN), date: 1,
+    old_reaction: [], new_reaction: [{type: "emoji", emoji: "👍"}]}});
+};
+const subPay = (from, charge, extra = {}) => bot.handleUpdate({update_id: ++updateId, message: {
+  message_id: ++msgId, date: 1, chat: {id: from, type: "private"}, from: user(from),
+  successful_payment: {currency: "XTR", total_amount: 300, invoice_payload: `sub:${SUB.id}`,
+    telegram_payment_charge_id: charge, provider_payment_charge_id: "",
+    subscription_expiration_date: Math.floor((Date.now() + 30 * DAY) / 1000), is_recurring: true, ...extra}}});
+const preCheckout = (from, payload = `sub:${SUB.id}`) => bot.handleUpdate({update_id: ++updateId, pre_checkout_query: {
+  id: `q${updateId}`, from: user(from), currency: "XTR", total_amount: 300, invoice_payload: payload}});
+
+await inChat(SUB, speaker(SUB_OWNER, "en"), command("/jetton EQ" + "b".repeat(46)));
+assert.ok(subChat().trial_started_at instanceof Date, "/jetton starts the trial");
+const trialStart = subChat().trial_started_at;
+for (let i = 0; i < 5; i++) await inChat(SUB, user(SUB_FAN), {text: `hello ${i}`});
+await subReact();
+assert.equal(subPoints(SUB_WRITER), 1, "the trial accrues");
+await inChat(SUB, speaker(SUB_OWNER, "en"), command("/jetton EQ" + "b".repeat(46)));
+assert.equal(subChat().trial_started_at.getTime(), trialStart.getTime(), "a trial never restarts");
+
+// Two days before the trial ends the creator is reminded, once.
+const sentBefore = sent.length;
+await chatsColl.updateOne({id: SUB.id}, {$set: {trial_started_at: new Date(Date.now() - 12 * DAY)}});
+await bot.subscriptions.run(new Date());
+await bot.subscriptions.run(new Date());
+const reminders = sent.slice(sentBefore).filter(m => m.chat_id === SUB_OWNER);
+assert.equal(reminders.length, 1);
+assert.match(reminders[0].text, /^The free trial of Paid Club ends on /);
+
+// Past the trial and the grace days: nothing accrues, /reward is refused,
+// the chat hears it once.
+await chatsColl.updateOne({id: SUB.id}, {$set: {trial_started_at: new Date(Date.now() - 20 * DAY)}});
+await inChat(SUB, speaker(SUB_OWNER, "en"), command("/verify")); // drops the cached chat config
+await subReact();
+assert.equal(subPoints(SUB_WRITER), 1);
+assert.equal(lastNoReward(), `no reward: subscription expired, points are paused (chat ${SUB.id}, message ${msgId}, from ${SUB_FAN})`);
+await inChat(SUB, speaker(SUB_OWNER, "en"), command("/reward 6003 5"));
+assert.match(textsTo(SUB.id).at(-1), /^Points are paused in this chat/);
+assert.equal(subPoints(SUB_WRITER), 1);
+await bot.subscriptions.run(new Date());
+await bot.subscriptions.run(new Date());
+assert.equal(textsTo(SUB.id).filter(text => text.startsWith("Achivator no longer counts points")).length, 1);
+assert.ok(subChat().sub_stop_announced_for);
+
+// Only the current creator may pay; anything else is refused before payment.
+await preCheckout(SUB_FAN);
+assert.deepEqual(callsOf("answerPreCheckoutQuery").at(-1),
+  {pre_checkout_query_id: `q${updateId}`, ok: false, error_message: "Only the current creator of the chat can pay for its subscription."});
+await preCheckout(SUB_OWNER, "something else");
+assert.equal(callsOf("answerPreCheckoutQuery").at(-1).ok, false);
+await preCheckout(SUB_OWNER);
+assert.deepEqual({...callsOf("answerPreCheckoutQuery").at(-1)}, {pre_checkout_query_id: `q${updateId}`, ok: true, error_message: undefined});
+
+// The payment resumes points and the chat hears it; a redelivered payment
+// changes nothing.
+await subPay(SUB_OWNER, "ch-1", {is_first_recurring: true});
+await subPay(SUB_OWNER, "ch-1", {is_first_recurring: true});
+assert.equal(cols.get("payments").docs.filter(d => d.chat_id === SUB.id).length, 1);
+assert.deepEqual({...subChat().subscription, at: null}, {payer_id: SUB_OWNER, charge_id: "ch-1", recurring: true, stars: 300, at: null});
+assert.ok(subChat().paid_until.getTime() > Date.now() + 29 * DAY);
+assert.equal(subChat().sub_stop_announced_for, undefined);
+assert.equal(textsTo(SUB.id).at(-1), "Achivator counts points in this chat again: the subscription is paid. Thank you!");
+assert.match(textsTo(SUB_OWNER).at(-1), /^Thank you! Points in Paid Club are paid until .* and renew every month\.$/);
+await subReact();
+assert.equal(subPoints(SUB_WRITER), 2, "paid again");
+
+// A renewal extends paid_until and keeps the subscription's first charge id.
+const firstUntil = subChat().paid_until.getTime();
+await subPay(SUB_OWNER, "ch-2", {subscription_expiration_date: Math.floor((Date.now() + 60 * DAY) / 1000)});
+assert.equal(subChat().subscription.charge_id, "ch-1");
+assert.ok(subChat().paid_until.getTime() > firstUntil);
+// a renewing subscription gets no "ends soon" reminder
+const beforeRenewingPass = sent.length;
+await chatsColl.updateOne({id: SUB.id}, {$set: {paid_until: new Date(Date.now() + DAY)}});
+await bot.subscriptions.run(new Date());
+assert.equal(sent.slice(beforeRenewingPass).filter(m => m.chat_id === SUB_OWNER).length, 0);
+
+// A new creator: the old payer's renewal is cancelled, what they paid stays
+// with the chat, and they hear why.
+statuses.set(SUB_HEIR, "creator");
+const paidUntilBeforeHandover = subChat().paid_until.getTime();
+await inChat(SUB, speaker(SUB_HEIR, "en"), command("/verify"));
+assert.deepEqual(callsOf("editUserStarSubscription").at(-1), {user_id: SUB_OWNER, telegram_payment_charge_id: "ch-1", is_canceled: true});
+assert.equal(subChat().subscription.recurring, false);
+assert.equal(subChat().creator, SUB_HEIR);
+assert.equal(subChat().paid_until.getTime(), paidUntilBeforeHandover);
+assert.match(textsTo(SUB_OWNER).at(-1), /^You are no longer the creator of Paid Club/);
+// the old creator can no longer pay for it
+await preCheckout(SUB_OWNER);
+assert.equal(callsOf("answerPreCheckoutQuery").at(-1).ok, false);
+// the heir subscribes from their own account
+await subPay(SUB_HEIR, "ch-3", {is_first_recurring: true});
+assert.deepEqual([subChat().subscription.payer_id, subChat().subscription.charge_id], [SUB_HEIR, "ch-3"]);
+statuses.delete(SUB_OWNER);
+statuses.delete(SUB_HEIR);
+
+// Off again: every chat accrues, as before subscriptions existed.
+delete process.env.SUBSCRIPTIONS_ENABLED;
+Telegram.prototype.callApi = plainCallApi;
+
 console.log = originalLog;
 console.log("ALL OK");
 // pending achievement clean-up timers would keep the process alive for 30 s
