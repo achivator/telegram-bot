@@ -35,16 +35,28 @@ jobs:
     concurrency:
       group: deploy-production
       cancel-in-progress: false
+    # URL and UUID are not secret, but accept them as secrets too: saving
+    # them on the wrong tab of the environment settings must not silently
+    # turn deploys off.
     env:
-      COOLIFY_URL: ${{ vars.COOLIFY_URL }}
-      COOLIFY_APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+      COOLIFY_URL: ${{ vars.COOLIFY_URL || secrets.COOLIFY_URL }}
+      COOLIFY_APP_UUID: ${{ vars.COOLIFY_APP_UUID || secrets.COOLIFY_APP_UUID }}
       COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
     steps:
       - name: Deploy to Coolify and wait for the result
         run: |
-          if [ -z "$COOLIFY_URL" ] || [ -z "$COOLIFY_APP_UUID" ] || [ -z "$COOLIFY_TOKEN" ]; then
+          missing=""
+          [ -n "$COOLIFY_URL" ] || missing="$missing COOLIFY_URL"
+          [ -n "$COOLIFY_APP_UUID" ] || missing="$missing COOLIFY_APP_UUID"
+          [ -n "$COOLIFY_TOKEN" ] || missing="$missing COOLIFY_TOKEN"
+          if [ "$missing" = " COOLIFY_URL COOLIFY_APP_UUID COOLIFY_TOKEN" ]; then
             echo "::warning::Coolify is not configured (COOLIFY_URL, COOLIFY_APP_UUID, COOLIFY_TOKEN); skipping deploy"
             exit 0
+          fi
+          # Half a configuration means someone meant to deploy: fail loudly.
+          if [ -n "$missing" ]; then
+            echo "::error::Coolify is only partly configured; missing in the production environment:$missing"
+            exit 1
           fi
           api="${COOLIFY_URL%/}/api/v1"
           auth="Authorization: Bearer $COOLIFY_TOKEN"
