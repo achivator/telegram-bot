@@ -46,6 +46,17 @@ function ruDecimal(value) {
   return String(value).replace(".", ",");
 }
 
+// "В чате «Мемы»", or "В одном из ваших чатов" when the title is unknown
+function ruInChat(title) {
+  return title ? `В чате «${title}»` : "В одном из ваших чатов";
+}
+
+// 1 балл, 3 балла, 5 баллов; a fraction takes "балла" (2,5 балла)
+function ruPointsWord(points) {
+  const n = Number(points);
+  return Number.isInteger(n) ? ruPlural(n, "балл", "балла", "баллов") : "балла";
+}
+
 const en = {
   languageName: "English",
   member: "member",
@@ -147,7 +158,8 @@ const en = {
   priceDecreaseScheduled: ({from, to, symbol, effective_at}) =>
     `The price of a point will drop on ${utcDateTime(effective_at, EN_MONTHS)}: ` +
     `1 point = ${from} → ${to} ${symbol || "jetton"}.\n` +
-    "Points already earned can be claimed at the current price until then — open the mini app.",
+    "Points already earned can be claimed at the current price until then — open the mini app.\n" +
+    "Start @achivator_bot in private to get personal reminders.",
   priceDecreased: ({from, to, symbol}) =>
     `The price of a point has dropped: 1 point = ${to} ${symbol || "jetton"} (was ${from}).`,
   priceIncreased: ({from, to, symbol, cancelled_pending}) =>
@@ -155,6 +167,18 @@ const en = {
     (cancelled_pending ? "\nThe planned decrease is cancelled." : ""),
   priceDecreaseCancelled: ({from, symbol}) =>
     `The planned price decrease is cancelled: 1 point stays ${from} ${symbol || "jetton"}.`,
+
+  // The same changes, in private to each member with unclaimed points.
+  // `points` and `estimate` (points × the current price) are decimal strings.
+  dmPriceDecreaseScheduled: ({chat_title, from, to, symbol, effective_at, points, estimate}) =>
+    `In ${chat_title || "one of your chats"}, the price of a point drops on ${utcDateTime(effective_at, EN_MONTHS)}: ` +
+    `1 point = ${from} → ${to} ${symbol || "jetton"}.\n` +
+    `You have ${points} ${points === "1" ? "point" : "points"} ` +
+    `(≈ ${estimate} ${symbol || "jetton"} at the current price). ` +
+    "Claim them before then to keep the current rate.",
+  dmPriceDecreaseCancelled: ({chat_title, from, symbol}) =>
+    `In ${chat_title || "one of your chats"}, the planned price drop is cancelled; ` +
+    `1 point stays ${from} ${symbol || "jetton"}.`,
 
   commandStart: "What Achivator is and how to set it up",
   commandHelp: "Setup guide",
@@ -277,7 +301,8 @@ const ru = {
   priceDecreaseScheduled: ({from, to, symbol, effective_at}) =>
     `Цена балла снизится ${utcDateTime(effective_at, RU_MONTHS)}: ` +
     `1 балл = ${ruDecimal(from)} → ${ruDecimal(to)} ${symbol || "жетона"}.\n` +
-    "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.",
+    "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.\n" +
+    "Чтобы получать личные напоминания, запустите @achivator_bot в личных сообщениях.",
   priceDecreased: ({from, to, symbol}) =>
     `Цена балла снизилась: 1 балл = ${ruDecimal(to)} ${symbol || "жетона"} (было ${ruDecimal(from)}).`,
   priceIncreased: ({from, to, symbol, cancelled_pending}) =>
@@ -285,6 +310,16 @@ const ru = {
     (cancelled_pending ? "\nЗапланированное снижение отменено." : ""),
   priceDecreaseCancelled: ({from, symbol}) =>
     `Запланированное снижение цены балла отменено: 1 балл по-прежнему стоит ${ruDecimal(from)} ${symbol || "жетона"}.`,
+
+  dmPriceDecreaseScheduled: ({chat_title, from, to, symbol, effective_at, points, estimate}) =>
+    `${ruInChat(chat_title)} цена балла снизится ${utcDateTime(effective_at, RU_MONTHS)}: ` +
+    `1 балл = ${ruDecimal(from)} → ${ruDecimal(to)} ${symbol || "жетона"}.\n` +
+    `У вас ${ruDecimal(points)} ${ruPointsWord(points)} ` +
+    `(≈ ${ruDecimal(estimate)} ${symbol || "жетона"} по текущей цене). ` +
+    "Заберите их до этого времени, чтобы сохранить текущий курс.",
+  dmPriceDecreaseCancelled: ({chat_title, from, symbol}) =>
+    `${ruInChat(chat_title)} запланированное снижение цены балла отменено: ` +
+    `1 балл по-прежнему стоит ${ruDecimal(from)} ${symbol || "жетона"}.`,
 
   commandStart: "Что такое Achivator и как его подключить",
   commandHelp: "Инструкция по настройке",

@@ -11,6 +11,8 @@ const statuses = new Map();
 // sendMessage to these chats fails, as it does once the bot is removed
 const failingChats = new Set();
 const sendAttempts = [];
+// private messages to these users fail with the error the function returns
+const dmFailures = new Map();
 Telegram.prototype.callApi = async function (method, payload) {
   if (method === "getChatMember") {
     const status = statuses.get(payload.user_id) ?? "member";
@@ -20,6 +22,7 @@ Telegram.prototype.callApi = async function (method, payload) {
   if (method === "sendMessage") {
     sendAttempts.push(payload.chat_id);
     if (failingChats.has(payload.chat_id)) throw new Error("Forbidden: bot was kicked from the group chat");
+    if (dmFailures.has(payload.chat_id)) throw dmFailures.get(payload.chat_id)();
     sent.push(payload);
     return {message_id: 1};
   }
@@ -34,6 +37,8 @@ const set = (doc, path, v) => { const ks = path.split("."); let o = doc; for (co
 const same = (a, b) => (a instanceof Date && b instanceof Date ? a.getTime() === b.getTime() : a === b);
 const OPS = {
   $lt: (x, v) => x != null && x < v,
+  $gt: (x, v) => x != null && x > v,
+  $in: (x, v) => v.some(y => same(x, y)),
   $lte: (x, v) => x != null && x <= v,
   $gte: (x, v) => x != null && x >= v,
   $ne: (x, v) => !same(x ?? null, v),
@@ -65,6 +70,13 @@ class Coll {
     return cursor;
   }
   async insertOne(doc) { doc._id ??= ++this.n; this.checkUnique(doc); this.docs.push(doc); return {insertedId: doc._id}; }
+  // unordered: inserts what it can, then reports the duplicates like the driver
+  async insertMany(docs) {
+    const writeErrors = [];
+    for (const doc of docs) await this.insertOne(doc).catch(error => writeErrors.push(error));
+    if (writeErrors.length) throw Object.assign(new Error("E11000"), {code: 11000, writeErrors});
+    return {insertedCount: docs.length};
+  }
   apply(doc, u, inserting) {
     for (const [k, v] of Object.entries(u.$inc || {})) set(doc, k, (get(doc, k) || 0) + v);
     for (const [k, v] of Object.entries(u.$set || {})) set(doc, k, v);
@@ -503,7 +515,8 @@ const [first, second] = await Promise.all([run(), run()]);
 assert.equal(first.sent + second.sent, 2);
 assert.deepEqual(textsTo(PRICE_RU.id), [
   "Цена балла снизится 5 октября 2026, 12:00 UTC: 1 балл = 0,5 → 0,25 MEME.\n" +
-    "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.",
+    "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.\n" +
+    "Чтобы получать личные напоминания, запустите @achivator_bot в личных сообщениях.",
   "Запланированное снижение цены балла отменено: 1 балл по-прежнему стоит 0,5 MEME.",
 ]);
 assert.deepEqual(buttons(sent.find(m => m.chat_id === PRICE_RU.id)), ["Открыть приложение https://t.me/achivator_bot/app"]);
@@ -520,7 +533,8 @@ await run();
 assert.deepEqual(textsTo(PRICE_EN.id), [
   "The price of a point has gone up: 1 point = 1 jetton (was 0.25).\nThe planned decrease is cancelled.",
   "The price of a point will drop on 5 Oct 2026, 12:00 UTC: 1 point = 1 → 0.5 USDT.\n" +
-    "Points already earned can be claimed at the current price until then — open the mini app.",
+    "Points already earned can be claimed at the current price until then — open the mini app.\n" +
+    "Start @achivator_bot in private to get personal reminders.",
 ]);
 assert.equal(t("en", "priceIncreased", {from: "1", to: "2", symbol: "X", cancelled_pending: false}),
   "The price of a point has gone up: 1 point = 2 X (was 1).");
@@ -636,6 +650,274 @@ bot.announcements.start(60 * 60 * 1000); // a second start is a no-op
 await settle();
 bot.announcements.stop();
 assert.equal(sent.length, queuedBefore + 1);
+console.error = originalError;
+
+// ---- Private reminders about a price decrease ----
+console.error = (...args) => errors.push(args.map(String).join(" "));
+const {TelegramError} = await import("telegraf");
+const {decimalMul, decimalSub} = await import("../decimal.mjs");
+const tgError = (error_code, description, parameters) => () => new TelegramError({ok: false, error_code, description, parameters});
+const rewardsColl = database.collection("rewards");
+const dmQueue = cols.get("dm_queue");
+const usersColl = database.collection("users");
+const waits = [];
+const runDms = now => bot.dms.run(now, {sleep: async ms => waits.push(ms)});
+const dmsTo = user_id => sent.filter(m => m.chat_id === user_id);
+const dmRows = source_id => dmQueue.docs.filter(d => String(d.source_id) === String(source_id));
+const holdersOf = source_id => dmRows(source_id).map(d => d.user_id).sort((a, b) => a - b);
+const giveReward = (chat_id, user_id, pts, claimed_points) =>
+  rewardsColl.insertOne({chat_id, user_id, points: pts, ...(claimed_points === undefined ? {} : {claimed_points})});
+const pendingDecrease = (from, price, effective_at) =>
+  ({price, to_default: false, from, symbol: "MEME", effective_at, requested_at: minutes(-5), by: CREATOR});
+const secondsLater = n => new Date(NOW.getTime() + n * 1000);
+
+// Exact decimal arithmetic for the estimate.
+assert.equal(0.1 * 3 === 0.3, false, "floats would get this wrong");
+assert.equal(decimalMul(3, "0.1"), "0.3");
+assert.equal(decimalMul("7", "0.000000001"), "0.000000007");
+assert.equal(decimalMul("1.50", "2"), "3");
+assert.equal(decimalMul(123456789012345, "0.123456789"), "15241578751714.595060205");
+assert.equal(decimalMul(0, "0.1"), "0");
+assert.equal(decimalMul("abc", "1"), null);
+assert.equal(decimalSub(5, 2), "3");
+assert.equal(decimalSub(1, 1), "0");
+assert.equal(decimalSub("0.3", "0.1"), "0.2");
+
+// The scheduled announcement in a Russian chat reaches every member with
+// unclaimed points there, in their own language (else the chat's), and
+// nobody else.
+const REMIND = {id: -900, type: "supergroup", title: "Meme Lords"};
+const REMIND_AT = new Date("2026-10-08T12:00:00Z");
+await chatsColl.insertOne({id: REMIND.id, title: "Meme Lords", lang: "ru", point_price: "0.1",
+  point_price_pending: pendingDecrease("0.1", "0.05", REMIND_AT)});
+await inChat(REMIND, speaker(1001, "ru"), {text: "привет"});
+await inChat(REMIND, speaker(1006, "en-US"), {text: "hi"});
+assert.equal((await usersColl.findOne({id: 1001})).lang, "ru");
+await inChat(REMIND, user(1006), {text: "no language_code keeps the last one"});
+assert.equal((await usersColl.findOne({id: 1006})).lang, "en");
+await giveReward(REMIND.id, 1001, 3);          // 3 unclaimed
+await giveReward(REMIND.id, 1002, 10, 10);     // all claimed
+await giveReward(REMIND.id, 1003, 5, 2);       // 3 unclaimed, never seen: the chat's language
+await giveReward(-901, 1004, 50);              // points in another chat only
+await giveReward(REMIND.id, 1005, 7);          // blocked the bot
+await giveReward(REMIND.id, 1006, 2);          // English app
+await giveReward(REMIND.id, 1007, 0);
+await botStatus(DM(1005), speaker(1005, "en"), "kicked");
+assert.ok((await usersColl.findOne({id: 1005})).dm_blocked_at, "blocking the bot in private is remembered");
+
+const {insertedId: reminder} = await queue(REMIND.id, "price_decrease_scheduled",
+  {from: "0.1", to: "0.05", symbol: "MEME", effective_at: REMIND_AT});
+await run();
+assert.equal(textsTo(REMIND.id).at(-1),
+  "Цена балла снизится 8 октября 2026, 12:00 UTC: 1 балл = 0,1 → 0,05 MEME.\n" +
+  "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.\n" +
+  "Чтобы получать личные напоминания, запустите @achivator_bot в личных сообщениях.");
+assert.deepEqual(holdersOf(reminder), [1001, 1003, 1006]);
+assert.ok(row(reminder).fanned_out_at && !("fanout_due" in row(reminder)));
+const reminderRow = id => dmRows(reminder).find(d => d.user_id === id);
+assert.deepEqual(dmRows(reminder).map(d => [d.user_id, d.lang, d.params.points, d.params.estimate]),
+  [[1001, "ru", "3", "0.3"], [1003, "ru", "3", "0.3"], [1006, "en", "2", "0.2"]]);
+assert.equal(reminderRow(1001).chat_id, REMIND.id);
+assert.equal(reminderRow(1001).kind, "price_decrease_scheduled");
+
+// Idempotent: another pass, and a fan-out run again, queue nobody twice.
+await run(minutes(1));
+await outbox.updateOne({_id: reminder}, {$set: {fanout_due: true}});
+await run(minutes(2));
+assert.equal(dmRows(reminder).length, 3);
+assert.ok(!("fanout_due" in row(reminder)));
+
+// Delivered with a button to the mini app, spaced 1/DM_RATE_PER_SEC apart.
+assert.deepEqual(bot.dms.limits, {ratePerSec: 20, intervalMs: 1000, budget: 20});
+assert.deepEqual(await runDms(NOW), {sent: 3, skipped: 0, failed: 0, paused: false});
+assert.deepEqual(dmsTo(1001).map(m => m.text), [
+  "В чате «Meme Lords» цена балла снизится 8 октября 2026, 12:00 UTC: 1 балл = 0,1 → 0,05 MEME.\n" +
+  "У вас 3 балла (≈ 0,3 MEME по текущей цене). Заберите их до этого времени, чтобы сохранить текущий курс."]);
+assert.deepEqual(dmsTo(1006).map(m => m.text), [
+  "In Meme Lords, the price of a point drops on 8 Oct 2026, 12:00 UTC: 1 point = 0.1 → 0.05 MEME.\n" +
+  "You have 2 points (≈ 0.2 MEME at the current price). Claim them before then to keep the current rate."]);
+assert.deepEqual(buttons(dmsTo(1006)[0]), ["Open the app https://t.me/achivator_bot/app"]);
+assert.deepEqual(buttons(dmsTo(1001)[0]), ["Открыть приложение https://t.me/achivator_bot/app"]);
+assert.equal(dmsTo(1003).length, 1);
+assert.equal(dmsTo(1002).length + dmsTo(1004).length + dmsTo(1005).length + dmsTo(1007).length, 0);
+assert.ok(dmRows(reminder).every(d => d.sent_at && !d.skipped));
+assert.deepEqual(await runDms(secondsLater(1)), {sent: 0, skipped: 0, failed: 0, paused: false}, "sent once");
+assert.equal(t("en", "dmPriceDecreaseScheduled", {chat_title: null, from: "1", to: "0.5", symbol: null,
+  effective_at: REMIND_AT, points: "1", estimate: "1"}),
+  "In one of your chats, the price of a point drops on 8 Oct 2026, 12:00 UTC: 1 point = 1 → 0.5 jetton.\n" +
+  "You have 1 point (≈ 1 jetton at the current price). Claim them before then to keep the current rate.");
+
+// The process dies between the chat message and queuing the private ones:
+// the next pass queues them, and the chat's later announcements wait.
+const CRASH = -901;
+await chatsColl.insertOne({id: CRASH, title: "Crash", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+const {insertedId: crashed} = await queue(CRASH, "price_decrease_scheduled",
+  {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT});
+const {insertedId: afterCrash} = await queue(CRASH, "price_increased",
+  {from: "1", to: "2", symbol: "MEME", cancelled_pending: false}, {created_at: minutes(0)});
+const realRewardsFind = rewardsColl.find;
+rewardsColl.find = () => { throw new Error("connection reset"); };
+await run(minutes(3));
+rewardsColl.find = realRewardsFind;
+assert.equal(textsTo(CRASH).length, 1, "the chat heard it");
+assert.equal(row(crashed).fanout_due, true);
+assert.equal(dmRows(crashed).length, 0);
+assert.equal(row(afterCrash).sent_at, null, "the chat's next announcement waits for the fan-out");
+assert.ok(errors.some(line => line.includes("queuing private messages failed")));
+await run(minutes(4));
+assert.deepEqual(holdersOf(crashed), [1004]);
+assert.ok(row(crashed).fanned_out_at && row(afterCrash).sent_at);
+await outbox.updateOne({_id: crashed}, {$set: {fanout_due: true}});
+await run(minutes(5));
+assert.equal(dmRows(crashed).length, 1, "a crash and a re-run never queue twice");
+assert.equal(textsTo(CRASH).length, 2);
+await chatsColl.updateOne({id: CRASH}, {$unset: {point_price_pending: ""}}); // the increase replaced it
+assert.deepEqual(await runDms(minutes(5)), {sent: 0, skipped: 1, failed: 0, paused: false},
+  "a reminder whose decrease is gone is dropped");
+assert.equal(dmRows(crashed)[0].skipped, "decrease no longer pending");
+assert.equal(dmsTo(1004).length, 0);
+
+// Rate limit: 50 queued reminders go out at most one second's budget per pass.
+const BIG = -904;
+await chatsColl.insertOne({id: BIG, title: "Big", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+for (let i = 0; i < 50; i++) await giveReward(BIG, 2000 + i, 1);
+const {insertedId: big} = await queue(BIG, "price_decrease_scheduled", {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT});
+await run(minutes(6));
+assert.equal(dmRows(big).length, 50);
+const bigSent = () => sent.filter(m => m.chat_id >= 2000 && m.chat_id < 2050).length;
+waits.length = 0;
+const firstPass = await runDms(minutes(6));
+assert.equal(firstPass.sent, 20);
+assert.equal(bigSent(), 20);
+assert.equal(waits.length >= 19, true, "every message waits for its slot");
+const gaps = waits.slice(1).map((w, i) => w - waits[i]);
+assert.ok(gaps.every(gap => gap > 40 && gap <= 50.001), `50 ms apart at 20/s: ${gaps}`);
+assert.equal((await runDms(minutes(6))).sent, 20);
+assert.equal(bigSent(), 40);
+assert.equal((await runDms(minutes(7))).sent, 10);
+assert.equal(bigSent(), 50);
+assert.equal(new Set(sent.filter(m => m.chat_id >= 2000 && m.chat_id < 2050).map(m => m.chat_id)).size, 50);
+
+// 403 and "chat not found": skipped, and the user is left out of later
+// fan-outs until they start the bot again.
+const BLOCK = -905;
+const blockPending = (price, at) => chatsColl.updateOne({id: BLOCK}, {$set: {point_price_pending: pendingDecrease("1", price, at)}});
+await chatsColl.insertOne({id: BLOCK, title: "Block", point_price: "1"});
+await blockPending("0.5", REMIND_AT);
+for (const id of [3003, 3004, 3005]) await giveReward(BLOCK, id, 4);
+dmFailures.set(3003, tgError(403, "Forbidden: bot was blocked by the user"));
+dmFailures.set(3004, tgError(400, "Bad Request: chat not found"));
+const {insertedId: block1} = await queue(BLOCK, "price_decrease_scheduled", {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT});
+await run(minutes(8));
+assert.deepEqual(await runDms(minutes(8)), {sent: 1, skipped: 2, failed: 0, paused: false});
+assert.deepEqual(dmRows(block1).map(d => [d.user_id, d.skipped ?? null]), [[3003, "unreachable"], [3004, "unreachable"], [3005, null]]);
+assert.match(dmRows(block1)[0].last_error, /blocked by the user/);
+assert.ok((await usersColl.findOne({id: 3003})).dm_blocked_at);
+assert.ok((await usersColl.findOne({id: 3004})).dm_blocked_at);
+dmFailures.delete(3003);
+dmFailures.delete(3004);
+const LATER = new Date("2026-10-09T12:00:00Z");
+await blockPending("0.4", LATER);
+const {insertedId: block2} = await queue(BLOCK, "price_decrease_scheduled", {from: "1", to: "0.4", symbol: "MEME", effective_at: LATER});
+await run(minutes(9));
+assert.deepEqual(holdersOf(block2), [3005], "blocked users are left out");
+await inChat(DM(3003), speaker(3003, "en"), command("/start"));
+assert.match(lastText(3003), /^Hi! I'm Achivator/);
+await botStatus(DM(3004), speaker(3004, "en"), "member");
+assert.equal((await usersColl.findOne({id: 3003})).dm_blocked_at, undefined, "/start clears it");
+assert.equal((await usersColl.findOne({id: 3004})).dm_blocked_at, undefined, "unblocking clears it");
+const LATEST = new Date("2026-10-10T12:00:00Z");
+await blockPending("0.3", LATEST);
+const {insertedId: block3} = await queue(BLOCK, "price_decrease_scheduled", {from: "1", to: "0.3", symbol: "MEME", effective_at: LATEST});
+await run(minutes(10));
+assert.deepEqual(holdersOf(block3), [3003, 3004, 3005]);
+// the replaced decreases' reminders still queued are dropped, the latest goes out
+await runDms(minutes(10));
+assert.equal(dmRows(block2)[0].skipped, "decrease no longer pending");
+assert.deepEqual([3003, 3004, 3005].map(id => dmsTo(id).filter(m => m.text.startsWith("In Block")).length), [1, 1, 2]);
+
+// A transient failure is retried with backoff and given up after 5 attempts.
+const FLAKY_DM = 3010;
+await dmQueue.insertOne({user_id: FLAKY_DM, chat_id: BLOCK, source_id: "manual", kind: "price_decrease_cancelled",
+  params: {chat_title: "Block", from: "1", to: "0.5", symbol: "MEME"}, lang: "en", created_at: minutes(11),
+  send_after: minutes(11), sent_at: null, claimed_at: null, attempts: 0, last_error: null});
+const flakyDm = () => dmQueue.docs.find(d => d.user_id === FLAKY_DM);
+dmFailures.set(FLAKY_DM, tgError(502, "Bad Gateway"));
+assert.equal((await runDms(minutes(11))).failed, 1);
+assert.deepEqual([flakyDm().attempts, flakyDm().claimed_at, flakyDm().sent_at], [1, null, null]);
+assert.equal(flakyDm().send_after.getTime(), minutes(11).getTime() + 30 * 1000);
+await runDms(minutes(11.2));
+assert.equal(flakyDm().attempts, 1, "not before send_after");
+for (let i = 12; i < 30; i += 3) await runDms(minutes(i));
+assert.equal(sendAttempts.filter(id => id === FLAKY_DM).length, 5);
+assert.deepEqual([flakyDm().attempts, flakyDm().sent_at, flakyDm().last_error], [5, null, "Bad Gateway"]);
+assert.ok(errors.some(line => line.includes(`to ${FLAKY_DM}: attempt 5 failed, giving up`)));
+dmFailures.delete(FLAKY_DM);
+
+// Cancelled: only members who got the reminder hear it; reminders still
+// queued are dropped instead. A chat without a language writes English.
+const CANCEL = {id: -906, type: "supergroup", title: "Cancel Club"};
+await chatsColl.insertOne({id: CANCEL.id, title: "Cancel Club", point_price: "0.5", point_price_pending: pendingDecrease("0.5", "0.25", REMIND_AT)});
+for (const id of [4001, 4002, 4003]) await giveReward(CANCEL.id, id, 2);
+await inChat(CANCEL, speaker(4003, "ru"), {text: "привет"});
+const {insertedId: toCancel} = await queue(CANCEL.id, "price_decrease_scheduled",
+  {from: "0.5", to: "0.25", symbol: "MEME", effective_at: REMIND_AT}, {created_at: minutes(29)});
+await run(minutes(30));
+assert.deepEqual(dmRows(toCancel).map(d => [d.user_id, d.lang]), [[4001, "en"], [4002, "en"], [4003, "ru"]]);
+dmFailures.set(4002, tgError(403, "Forbidden: bot can't initiate conversation with a user"));
+dmFailures.set(4003, tgError(500, "Internal Server Error"));
+await runDms(minutes(30));
+dmFailures.delete(4002);
+dmFailures.delete(4003);
+await giveReward(CANCEL.id, 4004, 9); // earned after the reminders went out
+await chatsColl.updateOne({id: CANCEL.id}, {$unset: {point_price_pending: ""}});
+const {insertedId: cancelRow} = await queue(CANCEL.id, "price_decrease_cancelled",
+  {from: "0.5", to: "0.25", symbol: "MEME"}, {created_at: minutes(31)});
+await run(minutes(32));
+assert.equal(textsTo(CANCEL.id).at(-1), "The planned price decrease is cancelled: 1 point stays 0.5 MEME.");
+assert.deepEqual(holdersOf(cancelRow), [4001]);
+assert.equal(dmRows(toCancel).find(d => d.user_id === 4003).skipped, "cancelled");
+await outbox.updateOne({_id: cancelRow}, {$set: {fanout_due: true}});
+await run(minutes(33));
+assert.deepEqual(holdersOf(cancelRow), [4001], "idempotent");
+await runDms(minutes(34));
+assert.deepEqual(dmsTo(4001).map(m => m.text), [
+  "In Cancel Club, the price of a point drops on 8 Oct 2026, 12:00 UTC: 1 point = 0.5 → 0.25 MEME.\n" +
+  "You have 2 points (≈ 1 MEME at the current price). Claim them before then to keep the current rate.",
+  "In Cancel Club, the planned price drop is cancelled; 1 point stays 0.5 MEME."]);
+assert.deepEqual([4002, 4003, 4004].map(id => dmsTo(id).length), [0, 0, 0]);
+assert.equal(t("ru", "dmPriceDecreaseCancelled", {chat_title: "Клуб", from: "0.5", symbol: null}),
+  "В чате «Клуб» запланированное снижение цены балла отменено: 1 балл по-прежнему стоит 0,5 жетона.");
+// a cancellation whose decrease was never announced to the chat reminds nobody
+const {insertedId: orphanCancel} = await queue(-907, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"});
+await run(minutes(35));
+assert.ok(row(orphanCancel).fanned_out_at);
+assert.equal(dmRows(orphanCancel).length, 0);
+
+// 429: the whole queue pauses for retry_after and the row is rescheduled.
+const insertDm = (user_id, at) => dmQueue.insertOne({user_id, chat_id: BLOCK, source_id: "manual-429", kind: "price_decrease_cancelled",
+  params: {chat_title: "Block", from: "1", to: "0.5", symbol: "MEME"}, lang: "en", created_at: at,
+  send_after: at, sent_at: null, claimed_at: null, attempts: 0, last_error: null});
+await insertDm(5001, minutes(40));
+await insertDm(5002, minutes(40));
+dmFailures.set(5001, tgError(429, "Too Many Requests: retry after 7", {retry_after: 7}));
+const limited = await runDms(minutes(40));
+assert.deepEqual(limited, {sent: 0, skipped: 0, failed: 0, paused: true});
+const dm5001 = dmQueue.docs.find(d => d.user_id === 5001);
+assert.deepEqual([dm5001.attempts, dm5001.claimed_at, dm5001.sent_at], [0, null, null]);
+assert.ok(dm5001.send_after.getTime() >= minutes(40).getTime() + 7000);
+assert.equal(sendAttempts.filter(id => id === 5002).length, 0, "the rest of the queue waits");
+dmFailures.delete(5001);
+assert.equal((await runDms(new Date(minutes(40).getTime() + 3000))).paused, true);
+assert.equal(sendAttempts.filter(id => id === 5001 || id === 5002).length, 1);
+assert.equal((await runDms(new Date(minutes(40).getTime() + 8000))).sent, 2);
+assert.deepEqual([dmsTo(5001).length, dmsTo(5002).length], [1, 1]);
+
+// The DM timer starts once and stops cleanly.
+bot.dms.start(60 * 60 * 1000);
+bot.dms.start(60 * 60 * 1000);
+await settle();
+bot.dms.stop();
 console.error = originalError;
 
 // A missing key falls back to English, an unknown key does not throw.
