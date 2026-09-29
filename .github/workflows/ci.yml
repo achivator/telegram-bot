@@ -1,0 +1,69 @@
+name: CI
+
+# Every pull request and every push to main runs the tests. A push to main (a
+# merged PR) that passes them is then deployed to Coolify; Coolify's own
+# auto-deploy must be off, otherwise it ships the commit before the tests have
+# run (docs/DEPLOY.md).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    # One rollout at a time; a newer merge waits instead of cancelling a
+    # deployment halfway.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    env:
+      COOLIFY_URL: ${{ vars.COOLIFY_URL }}
+      COOLIFY_APP_UUID: ${{ vars.COOLIFY_APP_UUID }}
+      COOLIFY_TOKEN: ${{ secrets.COOLIFY_TOKEN }}
+    steps:
+      - name: Deploy to Coolify and wait for the result
+        run: |
+          if [ -z "$COOLIFY_URL" ] || [ -z "$COOLIFY_APP_UUID" ] || [ -z "$COOLIFY_TOKEN" ]; then
+            echo "::warning::Coolify is not configured (COOLIFY_URL, COOLIFY_APP_UUID, COOLIFY_TOKEN); skipping deploy"
+            exit 0
+          fi
+          api="${COOLIFY_URL%/}/api/v1"
+          auth="Authorization: Bearer $COOLIFY_TOKEN"
+          started=$(curl -sS --fail-with-body -X POST -H "$auth" "$api/deploy?uuid=$COOLIFY_APP_UUID&force=false")
+          echo "$started"
+          deployment=$(echo "$started" | jq -r '.deployments[0].deployment_uuid // empty')
+          if [ -z "$deployment" ]; then
+            echo "::error::Coolify did not queue a deployment"
+            exit 1
+          fi
+          # Builds take a few minutes; give up after 20.
+          for _ in $(seq 1 120); do
+            status=$(curl -sS --fail-with-body -H "$auth" "$api/deployments/$deployment" | jq -r '.status')
+            echo "deployment $deployment: $status"
+            case "$status" in
+              finished) exit 0 ;;
+              failed|cancelled-by-user) echo "::error::Coolify deployment $status, see its logs in Coolify"; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::Coolify deployment still not finished after 20 minutes"
+          exit 1

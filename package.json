@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "",
   "main": "standalone.mjs",
+  "engines": {
+    "node": "22.x"
+  },
   "type": "module",
   "scripts": {
     "start": "node standalone.mjs",

@@ -57,6 +57,18 @@ const allowedUpdates = [
 
 bot.launch({ ...botOptions, allowedUpdates });
 
+// Point price announcements queued by the mini app, and scheduled price
+// decreases that fall due (ANNOUNCE_INTERVAL_MS).
+bot.announcements.start();
+// Private messages to members (price decrease reminders), at most
+// DM_RATE_PER_SEC per second, checked every DM_INTERVAL_MS.
+bot.dms.start();
+
 // Enable graceful stop
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    bot.announcements.stop();
+    bot.dms.stop();
+    bot.stop(signal);
+  });
+}
