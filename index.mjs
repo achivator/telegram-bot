@@ -418,6 +418,7 @@ export default function createBot(database, token, options) {
       source: grant.source,
       granted_by: grant.granted_by,
       source_message_id: grant.source_message_id ?? null,
+      // epoch ms, as every grant has always been dated (reaction_points use a Date)
       date: Date.now(),
     };
 
@@ -1539,9 +1540,18 @@ export default function createBot(database, token, options) {
           console.error(`chat ${chat.id}: malformed point_price_pending, not applied`, pending);
           continue;
         }
+        // The mini app values points still maturing at a decrease by the
+        // maturation in force then, which it snapshots in the pending; the
+        // entry carries it on (none on one scheduled before snapshots: the
+        // mini app then uses the chat's current setting). Never $slice the
+        // history: a decrease dropped from it stops protecting those points.
+        const entry = {old: pending.from, new: pending.price, at: pending.effective_at, by: pending.by};
+        if (Number.isInteger(pending.maturation_days) && pending.maturation_days >= 0) {
+          entry.maturation_days = pending.maturation_days;
+        }
         const update = {
           $unset: {point_price_pending: ""},
-          $push: {point_price_history: {old: pending.from, new: pending.price, at: pending.effective_at, by: pending.by}},
+          $push: {point_price_history: entry},
         };
         if (pending.to_default) update.$unset.point_price = "";
         else update.$set = {point_price: pending.price};

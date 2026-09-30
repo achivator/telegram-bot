@@ -337,6 +337,12 @@ await send(user(CREATOR), command("/lang ru"));
 const meme = await send(user(AUTHOR), {text: "meme"});
 await send(user(CREATOR), {...command("/reward 5 мем"), reply_to_message: {message_id: meme, date: 1, chat: CHAT, from: user(AUTHOR), text: "meme"}});
 assert.equal(lastText(CHAT.id), "U3: +5 баллов — мем\nИх можно будет забрать жетонами в мини-приложении, когда пройдёт срок созревания.");
+// grants are dated in epoch ms, reactions with a Date (what the mini app's lot
+// valuation and maturation expect)
+assert.ok(cols.get("grants").docs.length > 0);
+assert.ok(cols.get("grants").docs.every(d => Number.isSafeInteger(d.date)));
+assert.ok(cols.get("reaction_points").docs.length > 0);
+assert.ok(cols.get("reaction_points").docs.every(d => d.date instanceof Date));
 assert.deepEqual([1, 2, 5, 11, 21, 22, 112].map(n => t("ru", "rewardGranted", n, "X").split("\n")[0]),
   ["X: +1 балл", "X: +2 балла", "X: +5 баллов", "X: +11 баллов", "X: +21 балл", "X: +22 балла", "X: +112 баллов"]);
 assert.equal(t("en", "rewardGranted", 5, "U3", null),
@@ -634,7 +640,7 @@ assert.deepEqual(textsTo(-808), ["Цена балла снизилась: 1 ба
 const REQUESTED = new Date("2026-09-28T12:00:00Z");
 const pending = (price, extra = {}) => ({price, to_default: false, from: "0.5", symbol: "MEME",
   effective_at: EFFECTIVE, requested_at: REQUESTED, by: CREATOR, ...extra});
-await chatsColl.updateOne({id: PRICE_RU.id}, {$set: {point_price_pending: pending("0.25")}});
+await chatsColl.updateOne({id: PRICE_RU.id}, {$set: {point_price_pending: pending("0.25", {maturation_days: 4})}});
 await run(new Date(EFFECTIVE.getTime() - 1));
 const priceRu = () => cols.get("chats").docs.find(d => d.id === PRICE_RU.id);
 assert.equal(priceRu().point_price, "0.5", "not before effective_at");
@@ -644,7 +650,8 @@ const applied = await Promise.all([run(after), run(after)]);
 assert.equal(applied[0].applied + applied[1].applied, 1);
 assert.equal(priceRu().point_price, "0.25");
 assert.equal(priceRu().point_price_pending, undefined);
-assert.deepEqual(priceRu().point_price_history, [{old: "0.5", new: "0.25", at: EFFECTIVE, by: CREATOR}]);
+// the maturation snapshotted in the pending is carried into the history entry
+assert.deepEqual(priceRu().point_price_history, [{old: "0.5", new: "0.25", at: EFFECTIVE, by: CREATOR, maturation_days: 4}]);
 assert.deepEqual(textsTo(PRICE_RU.id).slice(2), ["Цена балла снизилась: 1 балл = 0,25 MEME (было 0,5)."]);
 await run(minutes(60 * 24 * 10));
 assert.equal(textsTo(PRICE_RU.id).length, 3);
@@ -655,6 +662,8 @@ await chatsColl.insertOne({id: PRICE_EN.id, point_price: "1",
 await run(after);
 const priceEn = cols.get("chats").docs.find(d => d.id === PRICE_EN.id);
 assert.ok(!("point_price" in priceEn) && !("point_price_pending" in priceEn));
+// a pending scheduled before snapshots: no maturation_days (the mini app falls
+// back to the chat's current setting)
 assert.deepEqual(priceEn.point_price_history, [{old: "1", new: "0.1", at: EFFECTIVE, by: CREATOR}]);
 assert.equal(textsTo(PRICE_EN.id).at(-1), "The price of a point has dropped: 1 point = 0.1 jetton (was 1).");
 
