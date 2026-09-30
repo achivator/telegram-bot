@@ -3,7 +3,7 @@ import {Telegraf, session} from "telegraf";
 import {channelPost, message} from "telegraf/filters";
 import {mention} from "telegraf/format";
 import {LANGUAGES, langFromCode, t} from "./i18n.mjs";
-import {createDmQueue, DM_MAX_ATTEMPTS} from "./dm-queue.mjs";
+import {classifyTelegramError, createDmQueue, createPause, DM_MAX_ATTEMPTS} from "./dm-queue.mjs";
 import {decimalMul, decimalSub, isPositiveDecimal} from "./decimal.mjs";
 import {parseSubscriptionPayload, serviceState, subscriptionConfig} from "./subscription.mjs";
 
@@ -153,6 +153,8 @@ export default function createBot(database, token, options) {
       lang: LANGUAGES.includes(chat?.lang) ? chat.lang : null,
       trial_started_at: chat?.trial_started_at ?? null,
       paid_until: chat?.paid_until ?? null,
+      // where the chat's announcements go since it became a supergroup
+      migrated_to_chat_id: chat?.migrated_to_chat_id ?? null,
     };
     chatConfigCache.set(chat_id, {value, expiresAt: Date.now() + CHAT_CONFIG_TTL_MS});
     return value;
@@ -758,6 +760,57 @@ export default function createBot(database, token, options) {
     await ctx.reply(t(await ctx.state.lang(), "migrationCompleted"));
   });
 
+  // ---- Group -> supergroup migration ----
+  // Telegram upgrades a group to a supergroup under a new chat id: the group
+  // gets a service message with `migrate_to_chat_id`, the supergroup one
+  // with `migrate_from_chat_id`, and a send to the old id fails with 400 and
+  // `parameters.migrate_to_chat_id` (postToChat). Whichever the bot sees
+  // first records the move; /migrate above is an unrelated one-off.
+  //
+  // Only delivery follows the chat: announcements are posted to
+  // `migrated_to_chat_id` (drainOutbox). Everything economic stays keyed by
+  // the old id (settings, prices, rewards, grants, paid reactions,
+  // payments, the outbox and private message rows), because the chat's TON
+  // pool is derived on-chain from that id and the mini app's claims, mints
+  // and counters are keyed by it; moving points to an id without a pool
+  // would strand the pool's funds. The old document gets
+  // `migrated_to_chat_id`, `migrated_at` and `migration_needs_review` for
+  // the operator, the new one (created if missing, never overwritten)
+  // `migrated_from_chat_id`. Recording it twice changes nothing.
+  async function migrateChat(from, to, now = new Date()) {
+    if (!from || !to || from === to) return;
+    await chats.updateOne({id: to}, {$setOnInsert: {id: to}}, {upsert: true});
+    await chats.updateOne({id: to, migrated_from_chat_id: null}, {$set: {migrated_from_chat_id: from}});
+    await chats.updateOne({id: from}, {$setOnInsert: {id: from}}, {upsert: true});
+    const first = unwrapModifyResult(
+      await chats.findOneAndUpdate(
+        {id: from, migrated_to_chat_id: null},
+        {$set: {migrated_to_chat_id: to, migrated_at: now, migration_needs_review: true}},
+      ),
+    );
+    chatConfigCache.delete(from);
+    chatConfigCache.delete(to);
+    if (first) {
+      console.error(
+        `chat ${from} migrated to ${to}; economic data and the TON pool stay keyed by ${from}` +
+          " — see issue #10 (migration_needs_review)",
+      );
+    }
+  }
+
+  telegraf.on(message("migrate_to_chat_id"), async (ctx, next) => {
+    await migrateChat(ctx.chat.id, ctx.message.migrate_to_chat_id).catch(error =>
+      console.error(`chat ${ctx.chat.id}: migration to ${ctx.message.migrate_to_chat_id} failed:`, error),
+    );
+    return next();
+  });
+  telegraf.on(message("migrate_from_chat_id"), async (ctx, next) => {
+    await migrateChat(ctx.message.migrate_from_chat_id, ctx.chat.id).catch(error =>
+      console.error(`chat ${ctx.message.migrate_from_chat_id}: migration to ${ctx.chat.id} failed:`, error),
+    );
+    return next();
+  });
+
   telegraf.command("verify", async ctx => {
     const lang = await ctx.state.lang();
     const type = ctx.chat?.type;
@@ -801,6 +854,20 @@ export default function createBot(database, token, options) {
       const logFailure = error => console.error("updating dm_blocked_at failed:", error);
       if (status === "member") await dms.clearBlocked(ctx.from.id).catch(logFailure);
       if (status === "kicked") await dms.markBlocked(ctx.from.id).catch(logFailure);
+    }
+
+    // In a group or channel: whether announcements can reach it (see
+    // markCannotPost).
+    if (ctx.chat && ctx.chat.type !== "private") {
+      const logFailure = error => console.error("updating bot_cannot_post_at failed:", error);
+      const member = ctx.update.my_chat_member.new_chat_member;
+      if (status === "member" || status === "administrator") await clearCannotPost(ctx.chat.id).catch(logFailure);
+      if (status === "left" || status === "kicked") {
+        await markCannotPost(ctx.chat.id, `the bot was ${status === "left" ? "removed from" : "banned in"} the chat`).catch(logFailure);
+      }
+      if (status === "restricted" && member?.can_send_messages === false) {
+        await markCannotPost(ctx.chat.id, "the bot may not send messages in the chat").catch(logFailure);
+      }
     }
 
     // Check if the bot was granted admin rights
@@ -1215,17 +1282,30 @@ export default function createBot(database, token, options) {
   // with type "price_decrease_scheduled" {from, to, symbol, effective_at},
   // "price_decrease_cancelled" {from, to, symbol}, "price_increased"
   // {from, to, symbol, cancelled_pending} or "price_decreased" {from, to,
-  // symbol}. The bot sends those, applies decreases that are due and
-  // announces them itself; the mini app queues "price_decreased" only when it
+  // symbol}. The bot sends those, applies decreases that are due and queues
+  // their "price_decreased" itself; the mini app queues one only when it
   // applied a due decrease before the bot did (a new price saved after
-  // effective_at). Prices are decimal
-  // strings; a chat without point_price uses the platform default, which the
-  // bot does not know. The bot caches nothing price-related (getChatConfig),
-  // so an applied decrease invalidates no cache.
+  // effective_at). A sent row gets `sent_at` and Telegram's `message_id`
+  // (and `posted_chat_id` when it went to the chat's supergroup).
+  // Prices are decimal strings; a chat without point_price uses the platform
+  // default, which the bot does not know. The bot caches nothing
+  // price-related (getChatConfig), so an applied decrease invalidates no
+  // cache.
   //
   // Every step claims its work atomically, so overlapping runs (a slow tick,
   // a second process) never send an announcement or apply a decrease twice.
   // Runs on a timer started by standalone.mjs: `bot.announcements.start()`.
+  //
+  // A failed send is retried on later passes, up to ANNOUNCE_MAX_ATTEMPTS,
+  // except when no retry can help: the bot was removed or restricted, or the
+  // chat is gone (the chat gets bot_cannot_post_at), or Telegram refuses the
+  // request itself. A 429 pauses sending (createPause) without counting as
+  // an attempt, and a group that became a supergroup is followed to its new
+  // id (migrateChat) and sent to there; the row keeps its chat_id and gets
+  // `posted_chat_id`. A row given up this way still has
+  // its members' private messages queued: they are what protects a member
+  // before a price decrease, and the chat not hearing it is all the more
+  // reason to write to them.
   const announcements = database.collection("announcements");
   const ANNOUNCE_INTERVAL_MS =
     Number(process.env.ANNOUNCE_INTERVAL_MS) > 0 ? Number(process.env.ANNOUNCE_INTERVAL_MS) : 60 * 1000;
@@ -1246,6 +1326,26 @@ export default function createBot(database, token, options) {
   announcements.createIndex({fanout_due: 1}, {sparse: true}).catch(console.error);
   announcements.createIndex({chat_id: 1, type: 1, created_at: 1}).catch(console.error);
   chats.createIndex({"point_price_pending.effective_at": 1}, {sparse: true}).catch(console.error);
+
+  // 400 errors that mean the bot cannot post in the chat, whatever the retry
+  // (a 403 always does): the chat is gone, or the bot lost the right to write.
+  const CHAT_UNREACHABLE =
+    /chat not found|not enough rights|have no rights|CHAT_WRITE_FORBIDDEN|CHAT_RESTRICTED|PEER_ID_INVALID|group chat was deactivated/i;
+
+  // ---- Chats the bot cannot post in ----
+  // `chats.bot_cannot_post_at` (a Date) and `bot_cannot_post_reason` (Telegram's
+  // error, or what happened to the bot) tell the mini app that the chat's
+  // announcements are lost. Set when a post fails for good or the bot is
+  // removed; cleared when a post goes through or the bot is added back.
+  function markCannotPost(chat_id, reason, at = new Date()) {
+    return chats.updateOne({id: chat_id}, {$set: {bot_cannot_post_at: at, bot_cannot_post_reason: reason}});
+  }
+  function clearCannotPost(chat_id) {
+    return chats.updateOne(
+      {id: chat_id, bot_cannot_post_at: {$ne: null}},
+      {$unset: {bot_cannot_post_at: "", bot_cannot_post_reason: ""}},
+    );
+  }
 
   // No member triggers an announcement: the chat's language, else English.
   async function chatLang(chat_id) {
@@ -1270,13 +1370,32 @@ export default function createBot(database, token, options) {
     };
   }
 
-  async function drainOutbox(now) {
+  // Sends `message` to the chat, following it to its supergroup if it has
+  // become one; resolves to {chat_id, message_id} of where it went.
+  async function postToChat(chat_id, message, where, now = new Date()) {
+    try {
+      const posted = await telegraf.telegram.sendMessage(chat_id, message.text, message.extra);
+      return {chat_id, message_id: posted?.message_id ?? null};
+    } catch (error) {
+      const outcome = classifyTelegramError(error, CHAT_UNREACHABLE);
+      if (outcome.kind !== "migrated") throw error;
+      console.log(`${where}: the group is now supergroup ${outcome.chatId}, following it`);
+      await migrateChat(chat_id, outcome.chatId, now);
+      const posted = await telegraf.telegram.sendMessage(outcome.chatId, message.text, message.extra);
+      return {chat_id: outcome.chatId, message_id: posted?.message_id ?? null};
+    }
+  }
+
+  // `held`: chats whose later announcements must wait (see below); a pass
+  // that drains twice shares it.
+  async function drainOutbox(now, held = new Set()) {
     let sent = 0;
     // after a failure the chat's later announcements wait, so it never hears
     // them out of order (e.g. "cancelled" before "will drop"); the same goes
     // for its members' private messages
-    const held = new Set();
     await fanOutMissed(now, held);
+    // Telegram asked for a pause (a 429, maybe seen by another process)
+    if (await telegramPause.until(now)) return sent;
 
     await announcements.updateMany(
       {sent_at: null, claimed_at: {$lte: new Date(now.getTime() - ANNOUNCE_CLAIM_TIMEOUT_MS)}},
@@ -1322,27 +1441,59 @@ export default function createBot(database, token, options) {
           continue;
         }
 
+        const fansOut = FAN_OUT_TYPES.has(row.type);
+        // a group that became a supergroup is posted to under its new id
+        const target = (await getChatConfig(row.chat_id)).migrated_to_chat_id ?? row.chat_id;
+        let posted;
         try {
-          await telegraf.telegram.sendMessage(row.chat_id, message.text, message.extra);
+          posted = await postToChat(target, message, where, now);
         } catch (error) {
+          const outcome = classifyTelegramError(error, CHAT_UNREACHABLE);
+          if (outcome.kind === "rate_limited") {
+            // Telegram's own instruction, not a failure of this announcement
+            const until = new Date(now.getTime() + outcome.retryAfterMs);
+            console.error(`${where}: rate limited, pausing until ${until.toISOString()}`);
+            await telegramPause
+              .set(until, outcome.description)
+              .catch(failure => console.error("storing the rate limit pause failed:", failure));
+            await announcements.updateOne({_id: row._id}, {$set: {claimed_at: null, last_error: outcome.description}});
+            break;
+          }
+          // the chat that refused it: postToChat may have followed a migration
+          const failedIn = (await getChatConfig(target)).migrated_to_chat_id ?? target;
           held.add(row.chat_id);
-          const attempts = (row.attempts || 0) + 1;
+          const permanent = outcome.kind === "unreachable" || outcome.kind === "rejected";
+          const attempts = permanent ? ANNOUNCE_MAX_ATTEMPTS : (row.attempts || 0) + 1;
           const giveUp = attempts >= ANNOUNCE_MAX_ATTEMPTS;
-          console.error(`${where}: attempt ${attempts} failed${giveUp ? ", giving up" : ""}:`, error?.message || error);
-          await announcements.updateOne(
-            {_id: row._id},
-            {$set: {claimed_at: null, last_error: String(error?.message || error)}, $inc: {attempts: 1}},
+          console.error(
+            `${where}: attempt ${(row.attempts || 0) + 1} failed${giveUp ? ", giving up" : ""}:`,
+            outcome.description,
           );
+          const update = {claimed_at: null, attempts, last_error: outcome.description};
+          // the members still hear it in private (see above)
+          if (giveUp && fansOut) update.fanout_due = true;
+          await announcements.updateOne({_id: row._id}, {$set: update});
+          if (outcome.kind === "unreachable") {
+            await markCannotPost(failedIn, outcome.description, now);
+            console.log(`chat ${failedIn}: the bot cannot post there (${outcome.description})`);
+          }
+          if (giveUp && fansOut) await completeFanOut(row, now);
           continue;
         }
-        // if this write fails the claim expires and the chat hears it twice,
-        // which beats never. `fanout_due` is set in the same write, so a
-        // process that dies right after it still leaves the members' private
-        // messages to queue (fanOutMissed).
-        const fansOut = FAN_OUT_TYPES.has(row.type);
-        await announcements.updateOne({_id: row._id}, {$set: fansOut ? {sent_at: now, fanout_due: true} : {sent_at: now}});
-        console.log(`${where}: sent`);
+        // At least once: if this write fails the claim expires and the chat
+        // hears it again ANNOUNCE_CLAIM_TIMEOUT_MS later, which beats never.
+        // Telegram has no idempotency key, and storing `message_id` in an
+        // earlier write would only be one more write that can fail the same
+        // way; it is kept for the record. `fanout_due` is set in the same
+        // write, so a process that dies right after it still leaves the
+        // members' private messages to queue (fanOutMissed).
+        const done = {sent_at: now, message_id: posted.message_id};
+        if (posted.chat_id !== row.chat_id) done.posted_chat_id = posted.chat_id;
+        if (fansOut) done.fanout_due = true;
+        await announcements.updateOne({_id: row._id}, {$set: done});
+        console.log(`${where}: sent${posted.chat_id !== row.chat_id ? ` to ${posted.chat_id}` : ""}`);
         sent++;
+        await clearCannotPost(posted.chat_id).catch(error => console.error("clearing bot_cannot_post_at failed:", error));
         if (fansOut && !(await completeFanOut(row, now))) held.add(row.chat_id);
       } catch (error) {
         // the claim expires and a later run retries
@@ -1370,7 +1521,15 @@ export default function createBot(database, token, options) {
   const FAN_OUT_TYPES = new Set(["price_decrease_scheduled", "price_decrease_cancelled"]);
   const USER_LOOKUP_CHUNK = 1000;
 
-  const dms = createDmQueue({database, telegram: telegraf.telegram, render: renderDm, isStale: staleDm});
+  // one 429 pause for the announcements and the private messages
+  const telegramPause = createPause(database);
+  const dms = createDmQueue({
+    database,
+    telegram: telegraf.telegram,
+    render: renderDm,
+    isStale: staleDm,
+    pause: telegramPause,
+  });
 
   function renderDm(row) {
     const params = row.params;
@@ -1469,8 +1628,9 @@ export default function createBot(database, token, options) {
       .sort({created_at: -1})
       .limit(1)
       .toArray();
-    // never announced, or already cancelled once: its reminders are not about this
-    if (!scheduled?.sent_at || scheduled.skipped) return 0;
+    // never announced nor reminded (a row given up still reminds), or
+    // already cancelled once: its reminders are not about this
+    if (!(scheduled?.sent_at || scheduled?.fanned_out_at) || scheduled.skipped) return 0;
     if (scheduled.dm_cancelled_by != null && String(scheduled.dm_cancelled_by) !== String(row._id)) return 0;
     await announcements.updateOne({_id: scheduled._id}, {$set: {dm_cancelled_by: row._id}});
 
@@ -1566,15 +1726,21 @@ export default function createBot(database, token, options) {
             (pending.to_default ? " (platform default)" : ""),
         );
 
+        // queued like the mini app's, so a failed send is retried
         const params = {from: pending.from, to: pending.price, symbol: pending.symbol ?? null};
-        const message = priceMessage(await chatLang(chat.id), "price_decreased", params);
-        if (!message) {
+        if (!priceMessage("en", "price_decreased", params)) {
           console.error(`chat ${chat.id}: price decrease not announced, malformed point_price_pending`, pending);
           continue;
         }
-        await telegraf.telegram
-          .sendMessage(chat.id, message.text, message.extra)
-          .catch(error => console.error(`chat ${chat.id}: price decrease announcement failed:`, error?.message || error));
+        await announcements.insertOne({
+          chat_id: chat.id,
+          type: "price_decreased",
+          params,
+          created_at: now,
+          sent_at: null,
+          claimed_at: null,
+          attempts: 0,
+        });
       } catch (error) {
         console.error(`chat ${chat.id}: applying the price decrease failed:`, error);
       }
@@ -1582,12 +1748,14 @@ export default function createBot(database, token, options) {
     return applied;
   }
 
-  // One pass: send queued announcements, then apply due decreases. Never
-  // rejects; resolves to what it did, for logs and tests.
+  // One pass: send queued announcements, then apply due decreases and send
+  // what they queued. Never rejects; resolves to what it did, for logs and
+  // tests.
   async function runAnnouncements(now = new Date()) {
     const done = {sent: 0, applied: 0, subscriptions: 0};
+    const held = new Set();
     try {
-      done.sent = await drainOutbox(now);
+      done.sent = await drainOutbox(now, held);
     } catch (error) {
       console.error("announcement outbox failed:", error);
     }
@@ -1595,6 +1763,13 @@ export default function createBot(database, token, options) {
       done.applied = await applyDueDecreases(now);
     } catch (error) {
       console.error("applying due price decreases failed:", error);
+    }
+    if (done.applied > 0) {
+      try {
+        done.sent += await drainOutbox(now, held);
+      } catch (error) {
+        console.error("announcement outbox failed:", error);
+      }
     }
     // hourly: reminders are days apart
     if (now.getTime() - lastSubscriptionPass >= SUBSCRIPTION_PASS_MS) {

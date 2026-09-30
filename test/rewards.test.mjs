@@ -8,7 +8,7 @@ const commandMenus = [];
 // chat member status by user id ("member" when unset); "error" makes the
 // lookup fail, as it does for an anonymous admin
 const statuses = new Map();
-// sendMessage to these chats fails, as it does once the bot is removed
+// sendMessage to these chats fails, as it does while Telegram is unreachable
 const failingChats = new Set();
 const sendAttempts = [];
 // private messages to these users fail with the error the function returns
@@ -21,7 +21,8 @@ Telegram.prototype.callApi = async function (method, payload) {
   }
   if (method === "sendMessage") {
     sendAttempts.push(payload.chat_id);
-    if (failingChats.has(payload.chat_id)) throw new Error("Forbidden: bot was kicked from the group chat");
+    if (failingChats.has(payload.chat_id)) throw new Error("connect ETIMEDOUT");
+    // any chat, despite the name: a TelegramError with a code and parameters
     if (dmFailures.has(payload.chat_id)) throw dmFailures.get(payload.chat_id)();
     sent.push(payload);
     return {message_id: 1};
@@ -654,6 +655,11 @@ assert.equal(priceRu().point_price_pending, undefined);
 // the maturation snapshotted in the pending is carried into the history entry
 assert.deepEqual(priceRu().point_price_history, [{old: "0.5", new: "0.25", at: EFFECTIVE, by: CREATOR, maturation_days: 4}]);
 assert.deepEqual(textsTo(PRICE_RU.id).slice(2), ["Цена балла снизилась: 1 балл = 0,25 MEME (было 0,5)."]);
+// through the outbox, and still in the pass that applied it
+assert.deepEqual(
+  cols.get("announcements").docs.filter(d => d.chat_id === PRICE_RU.id && d.type === "price_decreased")
+    .map(d => [d.params, d.sent_at.getTime(), d.message_id]),
+  [[{from: "0.5", to: "0.25", symbol: "MEME"}, after.getTime(), 1]]);
 await run(minutes(60 * 24 * 10));
 assert.equal(textsTo(PRICE_RU.id).length, 3);
 
@@ -963,6 +969,163 @@ bot.dms.start(60 * 60 * 1000);
 bot.dms.start(60 * 60 * 1000);
 await settle();
 bot.dms.stop();
+
+// ---- Delivery failures ----
+// A 403 is final: no retries, and the chat is flagged for the mini app until
+// the bot is added back or a post goes through.
+const KICKED = {id: -950, type: "supergroup", title: "Kicked"};
+const chatDoc = id => chatsColl.docs.find(d => d.id === id);
+await chatsColl.insertOne({id: KICKED.id, title: "Kicked"});
+dmFailures.set(KICKED.id, tgError(403, "Forbidden: bot was kicked from the supergroup chat"));
+const {insertedId: kicked} = await queue(KICKED.id, "price_increased", {from: "1", to: "2", symbol: "X", cancelled_pending: false},
+  {created_at: minutes(49)});
+await run(minutes(50));
+await run(minutes(51));
+assert.equal(sendAttempts.filter(id => id === KICKED.id).length, 1, "no retry after a 403");
+assert.deepEqual([row(kicked).attempts, row(kicked).sent_at], [5, null]);
+assert.equal(chatDoc(KICKED.id).bot_cannot_post_at.getTime(), minutes(50).getTime());
+assert.equal(chatDoc(KICKED.id).bot_cannot_post_reason, "Forbidden: bot was kicked from the supergroup chat");
+dmFailures.delete(KICKED.id);
+await botStatus(KICKED, speaker(31, "en"), "administrator");
+assert.ok(!("bot_cannot_post_at" in chatDoc(KICKED.id)), "added back");
+await botStatus(KICKED, speaker(31, "en"), "kicked");
+assert.match(chatDoc(KICKED.id).bot_cannot_post_reason, /banned/);
+await queue(KICKED.id, "price_decrease_cancelled", {from: "2", to: "1", symbol: "X"}, {created_at: minutes(51)});
+await run(minutes(52));
+assert.equal(textsTo(KICKED.id).at(-1), "The planned price decrease is cancelled: 1 point stays 2 X.");
+assert.ok(!("bot_cannot_post_at" in chatDoc(KICKED.id)) && !("bot_cannot_post_reason" in chatDoc(KICKED.id)),
+  "a post that goes through clears it");
+
+// The chat's message is given up, its members' reminders still go out, and
+// so does the cancellation to those reminded.
+const MUTED = {id: -951, title: "Muted"};
+await chatsColl.insertOne({id: MUTED.id, title: "Muted", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+await giveReward(MUTED.id, 6101, 4);
+dmFailures.set(MUTED.id, tgError(400, "Bad Request: not enough rights to send text messages to the chat"));
+const {insertedId: muted} = await queue(MUTED.id, "price_decrease_scheduled",
+  {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT}, {created_at: minutes(52)});
+await run(minutes(53));
+assert.deepEqual([row(muted).attempts, row(muted).sent_at, sendAttempts.filter(id => id === MUTED.id).length], [5, null, 1]);
+assert.ok(row(muted).fanned_out_at && chatDoc(MUTED.id).bot_cannot_post_at);
+assert.deepEqual(holdersOf(muted), [6101]);
+await runDms(minutes(53));
+assert.match(dmsTo(6101).at(-1).text, /^In Muted, the price of a point drops on 8 Oct 2026/);
+await chatsColl.updateOne({id: MUTED.id}, {$unset: {point_price_pending: ""}});
+const {insertedId: mutedCancel} = await queue(MUTED.id, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "MEME"},
+  {created_at: minutes(54)});
+await run(minutes(55));
+assert.equal(row(mutedCancel).sent_at, null);
+assert.deepEqual(holdersOf(mutedCancel), [6101]);
+await runDms(minutes(55));
+assert.equal(dmsTo(6101).at(-1).text, "In Muted, the planned price drop is cancelled; 1 point stays 1 MEME.");
+dmFailures.delete(MUTED.id);
+
+// A group that became a supergroup: the send to the old id fails with
+// migrate_to_chat_id, the move is recorded and the announcement goes to the
+// new id. Everything economic stays under the old id (its TON pool is
+// derived from it), and the new chat's own document is not overwritten.
+const OLD = -952, NEW = -100952;
+const JETTON = "EQ" + "c".repeat(46);
+await chatsColl.insertOne({id: OLD, title: "Old", lang: "ru", jetton_master: JETTON, creator: CREATOR, point_price: "1"});
+await chatsColl.insertOne({id: NEW, title: "New", lang: "en"});
+await giveReward(OLD, 6201, 3);
+const rewardsIn = chat_id => rewardsColl.docs.filter(d => d.chat_id === chat_id).map(d => [d.user_id, d.points]);
+dmFailures.set(OLD, tgError(400, "Bad Request: group chat was upgraded to a supergroup chat", {migrate_to_chat_id: NEW}));
+const {insertedId: movedRow} = await queue(OLD, "price_increased", {from: "1", to: "2", symbol: "X", cancelled_pending: false},
+  {created_at: minutes(55)});
+await run(minutes(56));
+assert.deepEqual(textsTo(NEW), ["Цена балла выросла: 1 балл = 2 X (было 1)."], "in the chat's language");
+assert.deepEqual([row(movedRow).chat_id, row(movedRow).posted_chat_id, row(movedRow).sent_at.getTime(), row(movedRow).attempts],
+  [OLD, NEW, minutes(56).getTime(), 0]);
+const withoutId = doc => Object.fromEntries(Object.entries(doc).filter(([k]) => k !== "_id"));
+const migratedChats = () => ({oldDoc: withoutId(chatDoc(OLD)), newDoc: withoutId(chatDoc(NEW))});
+assert.deepEqual(migratedChats(), {
+  oldDoc: {id: OLD, title: "Old", lang: "ru", jetton_master: JETTON, creator: CREATOR, point_price: "1",
+    migrated_to_chat_id: NEW, migrated_at: minutes(56), migration_needs_review: true},
+  newDoc: {id: NEW, title: "New", lang: "en", migrated_from_chat_id: OLD},
+});
+assert.deepEqual([rewardsIn(OLD), rewardsIn(NEW)], [[[6201, 3]], []], "points stay with the pool's chat id");
+const migrationLog = `chat ${OLD} migrated to ${NEW}; economic data and the TON pool stay keyed by ${OLD}`;
+assert.equal(errors.filter(line => line.includes(migrationLog)).length, 1);
+// the supergroup's service message records it again: nothing changes
+const snapshot = JSON.stringify(migratedChats());
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
+  chat: {id: NEW, type: "supergroup", title: "New"}, from: user(CREATOR), migrate_from_chat_id: OLD}});
+assert.equal(JSON.stringify(migratedChats()), snapshot);
+assert.equal(chatsColl.docs.filter(d => d.id === NEW).length, 1);
+assert.equal(errors.filter(line => line.includes(migrationLog)).length, 1, "logged once");
+// later announcements for the old id go straight to the new one
+await queue(OLD, "price_decrease_cancelled", {from: "2", to: "1", symbol: "X"}, {created_at: minutes(56)});
+await run(minutes(56.5));
+assert.equal(textsTo(NEW).length, 2);
+assert.equal(sendAttempts.filter(id => id === OLD).length, 1);
+dmFailures.delete(OLD);
+
+// The old group's service message: nothing is sent to the old id, the new
+// chat gets a minimal document, and a decrease announced for the old id
+// still reminds its members, whose points stay there.
+const OLD2 = -953, NEW2 = -100953;
+await chatsColl.insertOne({id: OLD2, title: "Old2", jetton_master: JETTON, point_price: "1",
+  point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+await giveReward(OLD2, 6301, 2);
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
+  chat: {id: OLD2, type: "group", title: "Old2"}, from: user(CREATOR), migrate_to_chat_id: NEW2}});
+assert.deepEqual(withoutId(chatDoc(NEW2)), {id: NEW2, migrated_from_chat_id: OLD2});
+assert.equal(chatDoc(OLD2).point_price_pending.price, "0.5");
+assert.equal(chatDoc(OLD2).migration_needs_review, true);
+const {insertedId: oldScheduled} = await queue(OLD2, "price_decrease_scheduled",
+  {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT}, {created_at: minutes(57)});
+await run(minutes(57));
+assert.equal(textsTo(NEW2).length, 1);
+assert.equal(sendAttempts.filter(id => id === OLD2).length, 0);
+assert.deepEqual([row(oldScheduled).chat_id, row(oldScheduled).posted_chat_id], [OLD2, NEW2]);
+assert.deepEqual(holdersOf(oldScheduled), [6301]);
+await runDms(minutes(57));
+assert.match(dmsTo(6301).at(-1).text, /^In Old2, the price of a point drops on 8 Oct 2026/);
+
+// The bot's own "price decreased" goes through the outbox: a failed send is
+// retried on the next pass.
+const DROP = -954;
+await chatsColl.insertOne({id: DROP, title: "Drop", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", minutes(57))});
+dmFailures.set(DROP, tgError(502, "Bad Gateway"));
+assert.equal((await run(minutes(58))).applied, 1);
+const dropRow = () => cols.get("announcements").docs.find(d => d.chat_id === DROP);
+assert.deepEqual([dropRow().type, dropRow().attempts, dropRow().sent_at], ["price_decreased", 1, null]);
+dmFailures.delete(DROP);
+await run(minutes(59));
+assert.deepEqual(textsTo(DROP), ["The price of a point has dropped: 1 point = 0.5 MEME (was 1)."]);
+
+// A 429 pauses every process: the pause is stored, and a second bot (a
+// rolling deploy) honours it, for private messages and announcements alike.
+const bot2 = createBot(database, "1:x");
+const noSleep = {sleep: async () => {}};
+await insertDm(5003, minutes(60));
+dmFailures.set(5003, tgError(429, "Too Many Requests: retry after 30", {retry_after: 30}));
+assert.equal((await runDms(minutes(60))).paused, true);
+dmFailures.delete(5003);
+const pauseDoc = cols.get("bot_state").docs.find(d => d._id === "telegram_pause");
+assert.ok(pauseDoc.pause_until.getTime() >= minutes(60).getTime() + 30 * 1000);
+const midPause = new Date(minutes(60).getTime() + 10 * 1000);
+assert.equal((await bot2.dms.run(midPause, noSleep)).paused, true, "the other process waits too");
+const {insertedId: waiting} = await queue(-955, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"},
+  {created_at: minutes(60)});
+await bot2.announcements.run(midPause);
+assert.equal(row(waiting).sent_at, null, "announcements wait too");
+await bot2.announcements.run(minutes(61));
+assert.ok(row(waiting).sent_at);
+assert.equal((await bot2.dms.run(minutes(61), noSleep)).sent, 1);
+// a 429 on an announcement pauses too, and is not a failed attempt
+dmFailures.set(-956, tgError(429, "Too Many Requests: retry after 20", {retry_after: 20}));
+const {insertedId: limitedRow} = await queue(-956, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"},
+  {created_at: minutes(62)});
+await run(minutes(62));
+assert.deepEqual([row(limitedRow).attempts, row(limitedRow).sent_at, row(limitedRow).claimed_at], [0, null, null]);
+dmFailures.delete(-956);
+assert.equal((await bot2.dms.run(new Date(minutes(62).getTime() + 10 * 1000), noSleep)).paused, true);
+await bot2.announcements.run(new Date(minutes(62).getTime() + 10 * 1000));
+assert.equal(row(limitedRow).sent_at, null);
+await run(minutes(63));
+assert.equal(textsTo(-956).length, 1);
 console.error = originalError;
 
 // A missing key falls back to English, an unknown key does not throw.
