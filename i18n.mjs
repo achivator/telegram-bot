@@ -143,9 +143,10 @@ const en = {
 
   langCurrent: languageName => `Chat language: ${languageName}.`,
   langNotSet: "Chat language is not set: I reply in the language of each member's Telegram app.",
-  langUsage: "To change it (creator and admins): /lang ru or /lang en",
-  langUnknown: value => `I don't speak "${value}" yet. Available: /lang ru or /lang en`,
+  langUsage: "To change it (creator and admins): /lang ru, /lang en, or /lang auto to follow each member's app",
+  langUnknown: value => `I don't speak "${value}" yet. Available: /lang ru, /lang en or /lang auto`,
   langSet: languageName => `Chat language set: ${languageName}. I will write here in English.`,
+  langAuto: "Chat language reset: I reply in the language of each member's Telegram app.",
   langAdminsOnly: "Only the chat creator and admins can change the chat language (I must be an admin to check).",
   langPrivate:
     "In a private chat I use the language of your Telegram app.\n" +
@@ -211,7 +212,7 @@ const en = {
   commandVerify: "Verify creator status",
   commandJetton: "Set the reward jetton for this chat (creators)",
   commandReward: "Grant points to a member (admins)",
-  commandLang: "Set the chat language: /lang ru or /lang en (admins)",
+  commandLang: "Set the chat language: /lang ru, en or auto (admins)",
 };
 
 const RU_MEMBER_STATUSES = {
@@ -313,9 +314,11 @@ const ru = {
 
   langCurrent: languageName => `Язык чата: ${languageName}.`,
   langNotSet: "Язык чата не задан: я отвечаю каждому на языке его приложения Telegram.",
-  langUsage: "Изменить (создатель и администраторы): /lang ru или /lang en",
-  langUnknown: value => `Язык «${value}» я пока не знаю. Доступны: /lang ru или /lang en`,
+  langUsage:
+    "Изменить (создатель и администраторы): /lang ru, /lang en или /lang auto — по языку приложения каждого участника",
+  langUnknown: value => `Язык «${value}» я пока не знаю. Доступны: /lang ru, /lang en или /lang auto`,
   langSet: languageName => `Язык чата: ${languageName}. Теперь я пишу здесь по-русски.`,
+  langAuto: "Язык чата сброшен: я отвечаю каждому на языке его приложения Telegram.",
   langAdminsOnly:
     "Менять язык чата могут только создатель и администраторы (чтобы это проверить, я должен быть администратором).",
   langPrivate:
@@ -377,7 +380,7 @@ const ru = {
   commandVerify: "Подтвердить, что вы создатель чата",
   commandJetton: "Задать жетон для наград в этом чате (создатель)",
   commandReward: "Начислить баллы участнику (администраторы)",
-  commandLang: "Язык чата: /lang ru или /lang en (администраторы)",
+  commandLang: "Язык чата: /lang ru, en или auto (администраторы)",
 };
 
 const DICTIONARIES = {en, ru};

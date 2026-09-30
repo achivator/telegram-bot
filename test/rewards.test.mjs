@@ -301,7 +301,7 @@ assert.equal((await database.collection("chats").findOne({id: MIXED.id}))?.lang,
 const ADMIN = 15;
 statuses.set(ADMIN, "administrator");
 await inChat(MIXED, speaker(ADMIN, "en"), command("/lang de"));
-assert.equal(lastText(MIXED.id), `I don't speak "de" yet. Available: /lang ru or /lang en`);
+assert.equal(lastText(MIXED.id), `I don't speak "de" yet. Available: /lang ru, /lang en or /lang auto`);
 await inChat(MIXED, speaker(ADMIN, "en"), command("/lang RU"));
 assert.equal(lastText(MIXED.id), "Язык чата: русский. Теперь я пишу здесь по-русски.");
 assert.equal((await database.collection("chats").findOne({id: MIXED.id})).lang, "ru");
@@ -311,12 +311,25 @@ assert.match(lastText(MIXED.id), /^Поздравляем, U16!/);
 await inChat(MIXED, speaker(ADMIN, "en"), command("/reward 5"));
 assert.match(lastText(MIXED.id), /^В этом чате ещё не задан жетон/);
 await inChat(MIXED, speaker(12, "en"), command("/lang"));
-assert.equal(lastText(MIXED.id), "Язык чата: русский.\nИзменить (создатель и администраторы): /lang ru или /lang en");
+assert.equal(lastText(MIXED.id),
+  "Язык чата: русский.\nИзменить (создатель и администраторы): /lang ru, /lang en или /lang auto — по языку приложения каждого участника");
 await inChat(MIXED, speaker(ADMIN, "ru"), command("/lang en"));
 assert.equal(lastText(MIXED.id), "Chat language set: English. I will write here in English.");
 await inChat(MIXED, speaker(17, "ru"), {sticker: {file_id: "s"}});
 await settle();
 assert.match(lastText(MIXED.id), /New achievement unlocked/);
+// /lang auto (admins only) removes the language: replies follow whoever
+// triggered them again, the confirmation included.
+await inChat(MIXED, speaker(11, "ru"), command("/lang auto"));
+assert.equal(lastText(MIXED.id), "Only the chat creator and admins can change the chat language (I must be an admin to check).");
+await inChat(MIXED, speaker(ADMIN, "ru"), command("/lang AUTO"));
+assert.equal(lastText(MIXED.id), "Язык чата сброшен: я отвечаю каждому на языке его приложения Telegram.");
+assert.equal((await database.collection("chats").findOne({id: MIXED.id})).lang, undefined);
+await inChat(MIXED, speaker(18, "ru"), {sticker: {file_id: "s"}});
+await settle();
+assert.match(lastText(MIXED.id), /^Поздравляем, U18!/);
+await inChat(MIXED, speaker(12, "en"), command("/lang"));
+assert.equal(lastText(MIXED.id), `${t("en", "langNotSet")}\n${t("en", "langUsage")}`);
 
 // A reward confirmation in a Russian group, with Russian plurals.
 statuses.set(CREATOR, "creator");
@@ -355,6 +368,20 @@ await send(user(CREATOR), command("/reward @MemeLord 2"));
 assert.equal(points(63), 2);
 assert.equal(points(61), 7);
 assert.equal((await database.collection("users").findOne({id: 61})).username, null);
+// A member without a username is mentioned by name: a text_mention entity
+// that carries the user. The name may have spaces; only a mention in the
+// target's place picks the target.
+const IVAN = {id: 64, is_bot: false, first_name: "Ivan", last_name: "Petrov"};
+const mentionCommand = (text, name, user) => ({text, entities: [
+  {type: "bot_command", offset: 0, length: text.split(" ")[0].length},
+  {type: "text_mention", offset: text.indexOf(name), length: name.length, user},
+]});
+await send(user(CREATOR), mentionCommand("/reward Ivan Petrov 4 мем", "Ivan Petrov", IVAN));
+assert.equal(lastText(CHAT.id), "Ivan: +4 балла — мем\nИх можно будет забрать жетонами в мини-приложении, когда пройдёт срок созревания.");
+assert.equal(points(IVAN.id), 4);
+await send(user(CREATOR), mentionCommand("/reward 3 за Ivan Petrov", "Ivan Petrov", IVAN));
+assert.match(lastText(CHAT.id), /^Начислить баллы участнику:/);
+assert.equal(points(IVAN.id), 4);
 statuses.delete(CREATOR);
 
 // Private chats follow the user's Telegram app.
@@ -483,8 +510,16 @@ await postInChannel("/reward 5");
 assert.equal(lastText(CHANNEL.id),
   "I cannot see who sent this (anonymous admin or a post on behalf of the channel).\n" +
   "Post as yourself, or run the command in the linked discussion group.");
+// Only the channel's admins post in it: a channel post may set the language,
+// yet it still cannot /reward (the grant must name who gave it).
 await postInChannel("/lang ru");
-assert.equal(lastText(CHANNEL.id), t("en", "cannotSeeSender"));
+assert.equal(lastText(CHANNEL.id), "Язык чата: русский. Теперь я пишу здесь по-русски.");
+assert.equal((await database.collection("chats").findOne({id: CHANNEL.id})).lang, "ru");
+await postInChannel("/reward 5");
+assert.equal(lastText(CHANNEL.id), t("ru", "cannotSeeSender"));
+await postInChannel("/lang auto");
+assert.equal(lastText(CHANNEL.id), "Chat language reset: I reply in the language of each member's Telegram app.");
+assert.equal((await database.collection("chats").findOne({id: CHANNEL.id})).lang, undefined);
 await postInChannel("/jetton");
 assert.equal(lastText(CHANNEL.id), "I cannot see who sent this (a post on behalf of the channel). Post as yourself to run /jetton.");
 

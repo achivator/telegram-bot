@@ -471,8 +471,13 @@ export default function createBot(database, token, options) {
     }
 
     const msg = ctx.message || ctx.channelPost;
-    const tokens = (msg.text || "").split(/\s+/).slice(1).filter(Boolean);
+    const text = msg.text || "";
+    const tokens = text.split(/\s+/).slice(1).filter(Boolean);
     const replyTo = msg.reply_to_message;
+    // A mention of a member without a username arrives as a text_mention
+    // entity that carries the user; its text is their name, spaces and all.
+    const firstArg = text.match(/^\S*\s*/)[0].length;
+    const textMention = msg.entities?.find(e => e.type === "text_mention" && e.offset === firstArg && e.user);
 
     let target = null;
     let args = tokens;
@@ -483,6 +488,9 @@ export default function createBot(database, token, options) {
         return;
       }
       target = {id: replyTo.from.id, name: replyTo.from.first_name || replyTo.from.username || String(replyTo.from.id)};
+    } else if (textMention) {
+      target = {id: textMention.user.id, name: textMention.user.first_name || String(textMention.user.id)};
+      args = text.slice(textMention.offset + textMention.length).split(/\s+/).filter(Boolean);
     } else {
       const first = tokens[0];
       args = tokens.slice(1);
@@ -574,7 +582,10 @@ export default function createBot(database, token, options) {
   }
 
   // /lang shows the chat's language, /lang ru|en changes it (creator and
-  // admins). The reply to a change is already in the new language.
+  // admins), /lang auto removes it: each reply then follows whoever triggered
+  // it. The reply to a change is already in the new language. A channel post
+  // hides its author, but only the channel's admins can post there, so it may
+  // change the language (not so for /reward, which records who granted).
   async function handleLang(ctx) {
     const lang = await ctx.state.lang();
     const type = ctx.chat?.type;
@@ -591,25 +602,35 @@ export default function createBot(database, token, options) {
       return;
     }
 
-    const admin = await requireAdmin(ctx, lang, "langAdminsOnly");
-    if (!admin.ok) {
-      await ctx.reply(admin.error);
-      return;
+    if (!ctx.channelPost) {
+      const admin = await requireAdmin(ctx, lang, "langAdminsOnly");
+      if (!admin.ok) {
+        await ctx.reply(admin.error);
+        return;
+      }
     }
 
-    if (!LANGUAGES.includes(arg)) {
+    if (arg !== "auto" && !LANGUAGES.includes(arg)) {
       await ctx.reply(t(lang, "langUnknown", arg.slice(0, 20)));
       return;
     }
 
-    await chats.updateOne(
-      {id: ctx.chat.id},
-      {$set: {lang: arg}, $setOnInsert: {title: ctx.chat.title || null}},
-      {upsert: true},
-    );
+    if (arg === "auto") {
+      await chats.updateOne({id: ctx.chat.id}, {$unset: {lang: ""}});
+    } else {
+      await chats.updateOne(
+        {id: ctx.chat.id},
+        {$set: {lang: arg}, $setOnInsert: {title: ctx.chat.title || null}},
+        {upsert: true},
+      );
+    }
     chatConfigCache.delete(ctx.chat.id);
-    console.log(`chat ${ctx.chat.id} language set to ${arg} by ${ctx.from.id}`);
+    console.log(`chat ${ctx.chat.id} language set to ${arg} by ${ctx.from?.id ?? "a channel post"}`);
 
+    if (arg === "auto") {
+      await ctx.reply(t(langFromCode(ctx.from?.language_code), "langAuto"));
+      return;
+    }
     await ctx.reply(t(arg, "langSet", t(arg, "languageName")));
   }
 

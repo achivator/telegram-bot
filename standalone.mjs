@@ -68,6 +68,13 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, () => {
     bot.announcements.stop();
     bot.dms.stop();
-    bot.stop(signal);
+    try {
+      bot.stop(signal);
+    } catch {
+      // "Bot is not running!": the signal came before launch finished (e.g.
+      // a Coolify restart during startup). Nothing is in flight yet, and
+      // launch would otherwise go on to start the bot.
+      process.exit(0);
+    }
   });
 }
