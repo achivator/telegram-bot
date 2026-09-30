@@ -13,7 +13,8 @@ import {performance} from "node:perf_hooks";
 // sends above that get HTTP 429 with `retry_after`. The queue sends at most
 // DM_RATE_PER_SEC (default 20, at most 25) messages per second, spaced
 // evenly, and at most one second's worth per pass. A 429 pauses the whole
-// queue for `retry_after` and puts the row back with `send_after`.
+// queue for `retry_after` (createPause: shared by every process, and by the
+// announcements) and puts the row back with `send_after`.
 //
 // A bot can only write to users who have started it. Those who have not, or
 // who blocked it (403), or whose account is gone (400 "chat not found"), get
@@ -36,14 +37,22 @@ const INSERT_CHUNK = 500;
 // blocked it, or their account no longer exists.
 const UNREACHABLE = /chat not found|user not found|PEER_ID_INVALID|user is deactivated/i;
 
-function classify(error) {
+// What a failed send means: "rate_limited" (wait `retryAfterMs`), "migrated"
+// (the group is now the supergroup `chatId`), "unreachable" (403, or a 400
+// matching `unreachable`: no retry will get through), "rejected" (any other
+// 4xx: a request Telegram will never accept) or "transient".
+export function classifyTelegramError(error, unreachable = UNREACHABLE) {
   const code = error?.code ?? error?.response?.error_code;
   const description = String(error?.description ?? error?.message ?? error);
+  const parameters = error?.parameters ?? error?.response?.parameters;
   if (code === 429) {
-    const retryAfter = Number(error?.parameters?.retry_after ?? error?.response?.parameters?.retry_after);
+    const retryAfter = Number(parameters?.retry_after);
     return {kind: "rate_limited", retryAfterMs: (retryAfter > 0 ? retryAfter : DEFAULT_RETRY_AFTER_S) * 1000, description};
   }
-  if (code === 403 || (code === 400 && UNREACHABLE.test(description))) return {kind: "unreachable", description};
+  if (code === 400 && parameters?.migrate_to_chat_id) {
+    return {kind: "migrated", chatId: Number(parameters.migrate_to_chat_id), description};
+  }
+  if (code === 403 || (code === 400 && unreachable.test(description))) return {kind: "unreachable", description};
   // any other 4xx is a request Telegram will never accept (our bug)
   if (typeof code === "number" && code >= 400 && code < 500) return {kind: "rejected", description};
   return {kind: "transient", description}; // 5xx, network
@@ -51,6 +60,35 @@ function classify(error) {
 
 function unwrap(result) {
   return result?.value !== undefined ? result.value : result;
+}
+
+// ---- Telegram's rate limit ----
+// After a 429 nothing may be sent until `retry_after` has passed. The pause
+// lives in the database, `bot_state` {_id: "telegram_pause", pause_until,
+// reason}, and is read before sending: during a rolling deploy two
+// containers run side by side, and a pause only one of them knew about would
+// let the other go on at full rate. A process also keeps the pause it hit
+// itself, in case storing it fails.
+const PAUSE_ID = "telegram_pause";
+
+export function createPause(database) {
+  const state = database.collection("bot_state");
+  let local = null;
+
+  // The moment sending may resume, or null when it may go on now.
+  async function until(now = new Date()) {
+    const doc = await state.findOne({_id: PAUSE_ID});
+    const stored = doc?.pause_until ? new Date(doc.pause_until) : null;
+    const latest = [local, stored].filter(at => at && at > now).sort((a, b) => b - a)[0];
+    return latest ?? null;
+  }
+  // $max: a shorter pause never cuts a longer one short
+  async function set(at, reason = null) {
+    if (!local || at > local) local = at;
+    await state.updateOne({_id: PAUSE_ID}, {$max: {pause_until: at}, $set: {reason}}, {upsert: true});
+  }
+
+  return {until, set};
 }
 
 const realSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -62,7 +100,15 @@ function positiveNumber(value, fallback) {
 // `render(row)` -> {text, extra} or null (malformed: given up);
 // `isStale(row, now, cache)` -> a reason to skip the row instead of sending,
 // or null; `cache` is a Map that lives for one pass.
-export function createDmQueue({database, telegram, render, isStale = async () => null, env = process.env}) {
+// `pause` is createPause's, shared with whatever else sends.
+export function createDmQueue({
+  database,
+  telegram,
+  render,
+  isStale = async () => null,
+  pause = createPause(database),
+  env = process.env,
+}) {
   const queue = database.collection("dm_queue");
   const users = database.collection("users");
 
@@ -80,9 +126,8 @@ export function createDmQueue({database, telegram, render, isStale = async () =>
   queue.createIndex({sent_at: 1, claimed_at: 1, send_after: 1}).catch(console.error);
 
   // Process-wide pacing: the earliest moment (performance.now()) the next
-  // message may go out, and the moment a 429 lifts.
+  // message may go out.
   let nextSlot = 0;
-  let pausedUntil = null;
 
   async function pace(sleep) {
     const delay = nextSlot - performance.now();
@@ -133,7 +178,7 @@ export function createDmQueue({database, telegram, render, isStale = async () =>
     const done = {sent: 0, skipped: 0, failed: 0, paused: false};
     const started = performance.now();
     try {
-      if (pausedUntil && pausedUntil > now) {
+      if (await pause.until(now)) {
         done.paused = true;
         return done;
       }
@@ -183,11 +228,14 @@ export function createDmQueue({database, telegram, render, isStale = async () =>
           try {
             await telegram.sendMessage(row.user_id, message.text, message.extra);
           } catch (error) {
-            const outcome = classify(error);
+            const outcome = classifyTelegramError(error);
             if (outcome.kind === "rate_limited") {
               // Telegram's own instruction, not a failure of this message
-              pausedUntil = new Date(now.getTime() + (performance.now() - started) + outcome.retryAfterMs);
-              console.error(`${where}: rate limited, pausing private messages until ${pausedUntil.toISOString()}`);
+              const pausedUntil = new Date(now.getTime() + (performance.now() - started) + outcome.retryAfterMs);
+              console.error(`${where}: rate limited, pausing until ${pausedUntil.toISOString()}`);
+              await pause
+                .set(pausedUntil, outcome.description)
+                .catch(failure => console.error("storing the rate limit pause failed:", failure));
               await queue.updateOne(
                 {_id: row._id},
                 {$set: {claimed_at: null, send_after: pausedUntil, last_error: outcome.description}},

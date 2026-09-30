@@ -82,6 +82,7 @@ class Coll {
     for (const [k, v] of Object.entries(u.$set || {})) set(doc, k, v);
     for (const k of Object.keys(u.$unset || {})) { const ks = k.split("."); const o = get(doc, ks.slice(0, -1).join(".")) ?? (ks.length === 1 ? doc : undefined); if (o) delete o[ks.at(-1)]; }
     for (const [k, v] of Object.entries(u.$push || {})) set(doc, k, [...(get(doc, k) || []), v]);
+    for (const [k, v] of Object.entries(u.$max || {})) if (get(doc, k) == null || get(doc, k) < v) set(doc, k, v);
     if (inserting) for (const [k, v] of Object.entries(u.$setOnInsert || {})) set(doc, k, v);
   }
   async upsertOrUpdate(f, u, opts = {}) {
