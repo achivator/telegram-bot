@@ -1047,6 +1047,21 @@ statuses.delete(SUB_HEIR);
 delete process.env.SUBSCRIPTIONS_ENABLED;
 Telegram.prototype.callApi = plainCallApi;
 
+// ---- Startup environment ----
+// Production needs the database, the token and the webhook domain; without
+// Grafana it starts with a warning. Development needs nothing.
+const {checkEnv} = await import("../env.mjs");
+const PROD = {NODE_ENV: "production", MONGODB_URI: "mongodb://db", ACHIVATOR_TOKEN: "1:x", WEBHOOK_URL: "bot.example.com"};
+assert.deepEqual(checkEnv(PROD),
+  {missing: [], warnings: ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_USER_ID, ACHIVATOR_GRAFANA_TOKEN"]});
+assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}), {missing: [], warnings: []});
+assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1"}).warnings,
+  ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_TOKEN"]);
+assert.deepEqual(checkEnv({NODE_ENV: "production", ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}).missing,
+  ["MONGODB_URI", "ACHIVATOR_TOKEN", "WEBHOOK_URL"]);
+assert.deepEqual(checkEnv({...PROD, WEBHOOK_URL: ""}).missing, ["WEBHOOK_URL"]);
+assert.deepEqual(checkEnv({NODE_ENV: "development"}), {missing: [], warnings: []});
+
 console.log = originalLog;
 console.log("ALL OK");
 // pending achievement clean-up timers would keep the process alive for 30 s

@@ -29,9 +29,12 @@ which pushed every commit on `main` without running the tests.
    - `PORT=3000`. It must match Ports Exposes.
    - `ACHIVATOR_TOKEN`, `MONGODB_URI`: the same database as the mini app
      (`achivator_bot`).
-   - `ACHIVATOR_GRAFANA_USER_ID`, `ACHIVATOR_GRAFANA_TOKEN`: **required in
-     production**. `standalone.mjs` exits on start without them, and Coolify
+   - `MONGODB_URI`, `ACHIVATOR_TOKEN` and `WEBHOOK_URL` are **required in
+     production**: `standalone.mjs` exits on start without them, and Coolify
      then shows a crash loop.
+   - `ACHIVATOR_GRAFANA_USER_ID`, `ACHIVATOR_GRAFANA_TOKEN`: optional Grafana
+     metrics. Without them the bot logs one warning on start ("Metrics
+     disabled") and runs.
    - Optional tuning: `CREATOR_MULTIPLIER`, `MIN_REACTOR_MESSAGES`,
      `PAIR_DAILY_CAP`, `RECEIVER_DAILY_CAP`, `REWARD_MAX_POINTS`.
    - Subscriptions in Telegram Stars: `SUBSCRIPTIONS_ENABLED`, `TRIAL_DAYS`,

@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import createBot from "./index.mjs";
+import { checkEnv } from "./env.mjs";
 import { MongoClient } from "mongodb";
 
 dotenv.config();
@@ -7,15 +8,10 @@ dotenv.config();
 const isProduction = process.env.NODE_ENV === "production";
 const isTelegramTestEnvironment = process.env.TELEGRAM_TEST_ENV === "true";
 
-const missingEnv = [
-  "MONGODB_URI",
-  "ACHIVATOR_GRAFANA_USER_ID",
-  "ACHIVATOR_GRAFANA_TOKEN",
-  "ACHIVATOR_TOKEN",
-  "WEBHOOK_URL",
-].filter((e) => !process.env[e]);
+const { missing: missingEnv, warnings } = checkEnv(process.env);
+for (const warning of warnings) console.warn(warning);
 
-if (isProduction && missingEnv.length > 0) {
+if (missingEnv.length > 0) {
   console.error("Missing ENV var:", missingEnv.join(", "));
   process.exit(1);
 }
