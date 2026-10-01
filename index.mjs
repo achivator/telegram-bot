@@ -621,11 +621,16 @@ export default function createBot(database, token, options) {
   // `old_jetton` and `new_jetton` are extra fields the mini app's readers
   // ignore.
 
-  // The platform default point price as the mini app has it (the same
-  // JETTONS_PER_POINT, same fallback), canonical, or null when unreadable.
-  // Only the history entry uses it: the mini app pays its own default.
-  function platformPointPrice() {
-    const raw = process.env.JETTONS_PER_POINT || "0.01";
+  // The platform default point price in force at `now`, as the mini app pays
+  // it: the default it stores (settings "point_price_default", kept in step
+  // with JETTONS_PER_POINT with notice, see its lib/platform-price.js) - its
+  // pending decrease once due - and the env (same fallback) only until the
+  // mini app has stored one. Canonical, or null when unreadable.
+  const settings = database.collection("settings");
+  async function platformPointPrice(now = new Date()) {
+    const doc = await settings.findOne({_id: "point_price_default"});
+    const due = doc?.pending && new Date(doc.pending.effective_at ?? NaN).getTime() <= now.getTime();
+    const raw = doc ? String(due ? doc.pending.price : doc.price) : process.env.JETTONS_PER_POINT || "0.01";
     const price = decimalMul(1, raw);
     return price !== null && isPositiveDecimal(price) ? price : null;
   }
@@ -633,34 +638,46 @@ export default function createBot(database, token, options) {
   const sameDecimal = (a, b) => decimalSub(a, b) === "0";
 
   // The history entry a due decrease becomes (as applyDueDecreases writes it).
-  function dueDecreaseEntry(pending) {
+  // `from_default`: whether the chat was on the platform default before it
+  // (the mini app merges the default's own changes into the chat's prices
+  // for those stretches).
+  function dueDecreaseEntry(pending, chat) {
     const entry = {old: pending.from, new: pending.price, at: pending.effective_at, by: pending.by};
     if (Number.isInteger(pending.maturation_days) && pending.maturation_days >= 0) {
       entry.maturation_days = pending.maturation_days;
     }
+    entry.from_default = chat.point_price == null;
     return entry;
   }
 
+  // Whether a due "back to default" decrease leaves the chat on the default:
+  // only if that is the price it was scheduled to (`pending.price`, which is
+  // what the mini app pays for it); else the chat keeps that price.
+  const landsOnDefault = (pending, platform) =>
+    Boolean(pending.to_default) && platform !== null && sameDecimal(String(pending.price), platform);
+
   // What switching `chat` (the stored document) to `master` does to its price.
-  function jettonPriceReset(chat, master, by, now) {
+  // `platform`: platformPointPrice(now).
+  function jettonPriceReset(chat, master, by, now, platform) {
     const history = [];
     const pending = chat.point_price_pending ?? null;
     const stored = chat.point_price ?? null;
-    const platform = platformPointPrice();
     let before = stored === null ? platform : String(stored);
+    let fromDefault = stored === null;
     let cancelledPending = false;
     if (pending) {
       // a decrease already due pays even before the bot applies it: it goes
       // into the history first, as the mini app writes it out on a save
       if (new Date(pending.effective_at ?? NaN).getTime() <= now.getTime() && isPrice(pending.price)) {
-        history.push(dueDecreaseEntry(pending));
+        history.push(dueDecreaseEntry(pending, chat));
         before = String(pending.price);
+        fromDefault = landsOnDefault(pending, platform);
       } else {
         cancelledPending = true;
       }
     }
     if (platform === null) {
-      console.error(`chat ${chat.id}: JETTONS_PER_POINT is not a positive decimal, the price reset is not in the history`);
+      console.error(`chat ${chat.id}: the platform default price is not a positive decimal, the price reset is not in the history`);
     } else if (before !== null && !sameDecimal(before, platform)) {
       history.push({
         old: before,
@@ -671,6 +688,7 @@ export default function createBot(database, token, options) {
         reason: "jetton_changed",
         old_jetton: chat.jetton_master,
         new_jetton: master,
+        from_default: fromDefault,
       });
     }
     // whether a price of the chat's own (custom, or a decrease) was dropped
@@ -685,6 +703,7 @@ export default function createBot(database, token, options) {
   // or the bot applying a decrease meanwhile makes it read again.
   async function setJetton(tgChat, master, by, now = new Date()) {
     const plain = {jetton_master: master, creator: by, title: tgChat.title};
+    const platform = await platformPointPrice(now);
     for (let attempt = 0; attempt < 3; attempt++) {
       const chat = await chats.findOne({id: tgChat.id});
       const old = chat?.jetton_master || null;
@@ -693,7 +712,7 @@ export default function createBot(database, token, options) {
         return null;
       }
 
-      const reset = jettonPriceReset(chat, master, by, now);
+      const reset = jettonPriceReset(chat, master, by, now, platform);
       const update = {
         $set: {
           ...plain,
@@ -1498,7 +1517,7 @@ export default function createBot(database, token, options) {
   // effective_at). A sent row gets `sent_at` and Telegram's `message_id`
   // (and `posted_chat_id` when it went to the chat's supergroup).
   // Prices are decimal strings; a chat without point_price uses the platform
-  // default, which the bot does not know. The bot caches nothing
+  // default the mini app stores (platformPointPrice). The bot caches nothing
   // price-related (getChatConfig), so an applied decrease invalidates no
   // cache.
   //
@@ -1544,6 +1563,8 @@ export default function createBot(database, token, options) {
   announcements
     .createIndex({key: 1}, {unique: true, partialFilterExpression: {key: {$type: "string"}}})
     .catch(console.error);
+  // the platform decrease a row announces, for its cancellation (mini app)
+  announcements.createIndex({platform: 1}, {sparse: true}).catch(console.error);
   chats.createIndex({"point_price_pending.effective_at": 1}, {sparse: true}).catch(console.error);
 
   // 400 errors that mean the bot cannot post in the chat, whatever the retry
@@ -2135,6 +2156,7 @@ export default function createBot(database, token, options) {
   // replaced it (a new requested_at) in the meantime.
   async function applyDueDecreases(now) {
     let applied = 0;
+    let platform; // the default in force, read for the first "back to default"
     const due = await chats
       .find({"point_price_pending.effective_at": {$lte: now}})
       .limit(ANNOUNCE_BATCH)
@@ -2151,15 +2173,16 @@ export default function createBot(database, token, options) {
         // entry carries it on (none on one scheduled before snapshots: the
         // mini app then uses the chat's current setting). Never $slice the
         // history: a decrease dropped from it stops protecting those points.
-        const entry = {old: pending.from, new: pending.price, at: pending.effective_at, by: pending.by};
-        if (Number.isInteger(pending.maturation_days) && pending.maturation_days >= 0) {
-          entry.maturation_days = pending.maturation_days;
-        }
+        const entry = dueDecreaseEntry(pending, chat);
         const update = {
           $unset: {point_price_pending: ""},
           $push: {point_price_history: entry},
         };
-        if (pending.to_default) update.$unset.point_price = "";
+        // "Back to default" lands on the default only while it is the price
+        // the decrease was scheduled to (miniapp#12): never a further drop
+        // nobody announced.
+        if (pending.to_default && platform === undefined) platform = await platformPointPrice(now);
+        if (pending.to_default && landsOnDefault(pending, platform)) update.$unset.point_price = "";
         else update.$set = {point_price: pending.price};
         const result = await chats.findOneAndUpdate(
           {id: chat.id, "point_price_pending.requested_at": pending.requested_at},
@@ -2169,7 +2192,7 @@ export default function createBot(database, token, options) {
         applied++;
         console.log(
           `chat ${chat.id}: point price decreased ${pending.from} -> ${pending.price}` +
-            (pending.to_default ? " (platform default)" : ""),
+            (update.$unset.point_price === "" ? " (platform default)" : pending.to_default ? " (the default moved: kept)" : ""),
         );
 
         // queued like the mini app's, so a failed send is retried
@@ -2258,6 +2281,60 @@ export default function createBot(database, token, options) {
     return added;
   }
 
+  // ---- The platform default's decreases (miniapp#12) ----
+  // The mini app stores the platform default (settings "point_price_default")
+  // and lowers it with notice when JETTONS_PER_POINT goes down: a `pending`
+  // {price, from, effective_at, requested_at} that pays from effective_at on,
+  // later written out as a `history` entry {old, new, at, requested_at}. Every
+  // chat on the default (with a jetton) hears it like a creator's decrease:
+  // "will drop" while it is ahead, "dropped" for PLATFORM_DROPPED_FOR_MS once
+  // in effect. One batch of chats per pass, walking them by _id and starting
+  // over at the end, so chats that join the default meanwhile hear it too;
+  // rows are keyed `<chat_id>:<type>:platform:<requested_at ms>`, so each
+  // chat hears it once. They carry `platform` (that ms): the mini app tells
+  // the same chats if the decrease is called off. No private reminders
+  // (fanOutScheduled finds no pending decrease of the chat's own).
+  const PLATFORM_DROPPED_FOR_MS = 2 * 86400 * 1000;
+  const platformSweep = {of: null, after: null};
+  async function queuePlatformAnnouncements(now) {
+    const doc = await settings.findOne({_id: "point_price_default"});
+    const last = doc?.history?.at(-1);
+    const decrease = doc?.pending
+      ? {from: doc.pending.from, to: doc.pending.price, at: doc.pending.effective_at, requested: doc.pending.requested_at}
+      : {from: last?.old, to: last?.new, at: last?.at, requested: last?.requested_at};
+    if (!(decrease.requested instanceof Date) || !(decrease.at instanceof Date) || !isPrice(decrease.from)) return 0;
+    const ahead = decrease.at > now;
+    if (!ahead && now.getTime() - decrease.at.getTime() >= PLATFORM_DROPPED_FOR_MS) return 0;
+    const type = ahead ? "price_decrease_scheduled" : "price_decreased";
+    const ref = decrease.requested.getTime();
+    if (platformSweep.of !== `${type}:${ref}`) Object.assign(platformSweep, {of: `${type}:${ref}`, after: null});
+
+    const filter = {point_price: null, jetton_master: {$ne: null}};
+    if (platformSweep.after !== null) filter._id = {$gt: platformSweep.after};
+    const batch = await chats.find(filter).sort({_id: 1}).limit(ANNOUNCE_BATCH).toArray();
+    platformSweep.after = batch.length < ANNOUNCE_BATCH ? null : batch.at(-1)._id;
+    const keyOf = chat => `${chat.id}:${type}:platform:${ref}`;
+    const known = new Set(
+      batch.length ? (await announcements.find({key: {$in: batch.map(keyOf)}}).toArray()).map(row => row.key) : [],
+    );
+    const params = {from: String(decrease.from), to: String(decrease.to), symbol: null};
+    if (ahead) params.effective_at = decrease.at;
+    let added = 0;
+    for (const chat of batch) {
+      if (known.has(keyOf(chat))) continue;
+      const row = {chat_id: chat.id, type, params, platform: ref, created_at: ahead ? decrease.requested : decrease.at,
+        sent_at: null, claimed_at: null, attempts: 0};
+      try {
+        await announcements.updateOne({key: keyOf(chat)}, {$setOnInsert: row}, {upsert: true});
+        added++;
+      } catch (error) {
+        if (error?.code !== 11000) throw error; // queued by an overlapping pass
+      }
+    }
+    if (added) console.log(`platform price ${params.from} -> ${params.to}: ${added} chats to tell (${type})`);
+    return added;
+  }
+
   // One pass: send queued announcements, then apply due decreases and send
   // what they queued. Never rejects; resolves to what it did, for logs and
   // tests.
@@ -2268,6 +2345,11 @@ export default function createBot(database, token, options) {
       await queueMissedScheduled(now);
     } catch (error) {
       console.error("queuing missed price announcements failed:", error);
+    }
+    try {
+      await queuePlatformAnnouncements(now);
+    } catch (error) {
+      console.error("queuing platform price announcements failed:", error);
     }
     try {
       done.sent = await drainOutbox(now, held);

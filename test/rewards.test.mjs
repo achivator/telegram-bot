@@ -662,7 +662,8 @@ assert.equal(applied[0].applied + applied[1].applied, 1);
 assert.equal(priceRu().point_price, "0.25");
 assert.equal(priceRu().point_price_pending, undefined);
 // the maturation snapshotted in the pending is carried into the history entry
-assert.deepEqual(priceRu().point_price_history, [{old: "0.5", new: "0.25", at: EFFECTIVE, by: CREATOR, maturation_days: 4}]);
+assert.deepEqual(priceRu().point_price_history,
+  [{old: "0.5", new: "0.25", at: EFFECTIVE, by: CREATOR, maturation_days: 4, from_default: false}]);
 assert.deepEqual(textsTo(PRICE_RU.id).slice(2), ["Цена балла снизилась: 1 балл = 0,25 MEME (было 0,5)."]);
 // through the outbox, and still in the pass that applied it
 assert.deepEqual(
@@ -672,16 +673,29 @@ assert.deepEqual(
 await run(minutes(60 * 24 * 10));
 assert.equal(textsTo(PRICE_RU.id).length, 3);
 
-// Back to the platform default: point_price is removed; English chat.
+// Back to the platform default (0.01, JETTONS_PER_POINT's fallback while the
+// mini app has stored none): point_price is removed; English chat.
 await chatsColl.insertOne({id: PRICE_EN.id, point_price: "1",
-  point_price_pending: pending("0.1", {to_default: true, from: "1", symbol: null})});
+  point_price_pending: pending("0.01", {to_default: true, from: "1", symbol: null})});
 await run(after);
 const priceEn = cols.get("chats").docs.find(d => d.id === PRICE_EN.id);
 assert.ok(!("point_price" in priceEn) && !("point_price_pending" in priceEn));
 // a pending scheduled before snapshots: no maturation_days (the mini app falls
 // back to the chat's current setting)
-assert.deepEqual(priceEn.point_price_history, [{old: "1", new: "0.1", at: EFFECTIVE, by: CREATOR}]);
-assert.equal(textsTo(PRICE_EN.id).at(-1), "The price of a point has dropped: 1 point = 0.1 jetton (was 1).");
+assert.deepEqual(priceEn.point_price_history, [{old: "1", new: "0.01", at: EFFECTIVE, by: CREATOR, from_default: false}]);
+assert.equal(textsTo(PRICE_EN.id).at(-1), "The price of a point has dropped: 1 point = 0.01 jetton (was 1).");
+// The default the mini app stores has moved below the price the decrease was
+// scheduled to: the chat keeps that price (what the mini app pays for it),
+// rather than dropping further unannounced (miniapp#12).
+const settingsColl = database.collection("settings");
+await settingsColl.insertOne({_id: "point_price_default", price: "0.008", history: []});
+await chatsColl.insertOne({id: -813, point_price: "1",
+  point_price_pending: pending("0.01", {to_default: true, from: "1", symbol: null})});
+await run(after);
+const kept813 = cols.get("chats").docs.find(d => d.id === -813);
+assert.equal(kept813.point_price, "0.01");
+assert.equal(kept813.point_price_history[0].new, "0.01");
+await settingsColl.findOneAndDelete({_id: "point_price_default"});
 
 // The mini app replaced the pending decrease after the bot read it: the one
 // read is not applied (the new one waits for its own effective_at).
@@ -1482,7 +1496,7 @@ const [kept, resetEntry] = switchChat().point_price_history;
 assert.deepEqual(kept, earlier);
 assert.ok(resetEntry.at instanceof Date);
 assert.deepEqual({...resetEntry, at: null}, {old: "0.5", new: "0.01", at: null, by: SWITCH_OWNER, maturation_days: 0,
-  reason: "jetton_changed", old_jetton: OLD_JETTON, new_jetton: NEW_JETTON});
+  reason: "jetton_changed", old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, from_default: false});
 const confirm = switchChat().point_price_confirm_required;
 assert.deepEqual({...confirm, at: null},
   {reason: "jetton_changed", at: null, by: SWITCH_OWNER, old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, old_price: "0.5"});
@@ -1519,16 +1533,17 @@ assert.deepEqual(switchChat().point_price_confirm_required, confirm);
 
 // A decrease already due goes into the history before the reset; a chat
 // already at the default price gets no reset entry. The default comes from
-// JETTONS_PER_POINT, as in the mini app.
+// JETTONS_PER_POINT until the mini app has stored one.
 process.env.JETTONS_PER_POINT = "0.10";
 const dueAt = new Date(Date.now() - DAY_MS);
 await chatsColl.updateOne({id: SWITCH.id}, {$set: {point_price_pending: {price: "0.15", to_default: false, from: "0.2",
   symbol: null, effective_at: dueAt, requested_at: requestedAt, by: SWITCH_OWNER, maturation_days: 2}}});
 await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${OLD_JETTON}`));
 assert.deepEqual(switchChat().point_price_history.slice(2).map(h => ({...h, at: h.at.getTime()})), [
-  {old: "0.2", new: "0.15", at: dueAt.getTime(), by: SWITCH_OWNER, maturation_days: 2},
+  {old: "0.2", new: "0.15", at: dueAt.getTime(), by: SWITCH_OWNER, maturation_days: 2, from_default: false},
   {old: "0.15", new: "0.1", at: switchChat().point_price_confirm_required.at.getTime(), by: SWITCH_OWNER,
-    maturation_days: 0, reason: "jetton_changed", old_jetton: rawAddress(NEW_JETTON), new_jetton: OLD_JETTON},
+    maturation_days: 0, reason: "jetton_changed", old_jetton: rawAddress(NEW_JETTON), new_jetton: OLD_JETTON,
+    from_default: false},
 ]);
 assert.equal(switchRows().at(-1).params.cancelled_pending, false);
 assert.equal(switchChat().point_price_pending, undefined);
@@ -1550,8 +1565,50 @@ assert.equal(lastText(SWITCH_RU.id),
   `Был: ${OLD_JETTON}\nТеперь: ${NEW_JETTON}\n\n` +
   "Цена балла остаётся стандартной ценой платформы, пока создатель не задаст свою в мини-приложении." +
   "\nНезабранные баллы теперь выплачиваются новым жетоном.");
+// Once the mini app stores the default, that is the one (miniapp#12).
+await settingsColl.insertOne({_id: "point_price_default", price: "0.2", history: []});
+await chatsColl.updateOne({id: SWITCH.id}, {$set: {point_price: "0.5"}});
+await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${NEW_JETTON}`));
+assert.deepEqual([switchChat().point_price_history.at(-1).new, switchChat().point_price_confirm_required.old_price], ["0.2", "0.5"]);
+await settingsColl.findOneAndDelete({_id: "point_price_default"});
 delete process.env.JETTONS_PER_POINT;
 statuses.delete(SWITCH_OWNER);
+
+// ---- The platform default's decreases (miniapp#12) ----
+// The operator lowered JETTONS_PER_POINT and the mini app scheduled it with
+// notice: every chat on the default (with a jetton) hears it ahead, once, and
+// again once it is in effect; chats with their own price do not.
+const PLAT_A = -970, PLAT_B = -971, PLAT_OWN = -972, PLAT_NONE = -973;
+await chatsColl.insertOne({id: PLAT_A, jetton_master: OLD_JETTON});
+await chatsColl.insertOne({id: PLAT_B, jetton_master: OLD_JETTON, lang: "ru"});
+await chatsColl.insertOne({id: PLAT_OWN, jetton_master: OLD_JETTON, point_price: "0.02"});
+await chatsColl.insertOne({id: PLAT_NONE});
+const platRequested = minutes(100), platEffective = minutes(100 + 60 * 24 * 7);
+await settingsColl.insertOne({_id: "point_price_default", price: "0.01", history: [],
+  pending: {price: "0.005", from: "0.01", effective_at: platEffective, requested_at: platRequested}});
+const platRows = chat_id => outbox.docs.filter(d => d.chat_id === chat_id && d.platform !== undefined);
+await run(minutes(101));
+assert.deepEqual(platRows(PLAT_A).map(d => [d.key, d.type, d.params, d.platform, d.created_at]), [[
+  `${PLAT_A}:price_decrease_scheduled:platform:${platRequested.getTime()}`, "price_decrease_scheduled",
+  {from: "0.01", to: "0.005", symbol: null, effective_at: platEffective}, platRequested.getTime(), platRequested]]);
+assert.match(textsTo(PLAT_A).at(-1), /^The price of a point will drop on 8 Oct 2026, 10:40 UTC: 1 point = 0\.01 → 0\.005 jetton\./);
+assert.match(textsTo(PLAT_B).at(-1), /^Цена балла снизится 8 октября 2026, 10:40 UTC: 1 балл = 0,01 → 0,005 жетона\./);
+assert.equal(platRows(PLAT_OWN).length + platRows(PLAT_NONE).length, 0);
+await run(minutes(102));
+assert.equal(platRows(PLAT_A).length, 1, "once");
+// in effect (written out by the mini app or not): "dropped", once
+const platAfter = new Date(platEffective.getTime() + 60 * 1000);
+await run(platAfter);
+await run(new Date(platAfter.getTime() + 60 * 1000));
+assert.deepEqual(platRows(PLAT_A).map(d => d.type), ["price_decrease_scheduled", "price_decreased"]);
+assert.equal(textsTo(PLAT_A).at(-1), "The price of a point has dropped: 1 point = 0.005 jetton (was 0.01).");
+// and only for a while after it
+await settingsColl.updateOne({_id: "point_price_default"}, {$set: {price: "0.005",
+  history: [{old: "0.01", new: "0.005", at: platEffective, requested_at: platRequested}]}, $unset: {pending: ""}});
+await chatsColl.insertOne({id: -974, jetton_master: OLD_JETTON});
+await run(new Date(platEffective.getTime() + 3 * DAY_MS));
+assert.equal(platRows(-974).length, 0);
+await settingsColl.findOneAndDelete({_id: "point_price_default"});
 
 // A missing key falls back to English, an unknown key does not throw.
 assert.equal(t("de", "jettonWhere"), "Run this command in a group or channel.");
