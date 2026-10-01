@@ -37,6 +37,9 @@ which pushed every commit on `main` without running the tests.
      disabled") and runs.
    - Optional tuning: `CREATOR_MULTIPLIER`, `MIN_REACTOR_MESSAGES`,
      `PAIR_DAILY_CAP`, `RECEIVER_DAILY_CAP`, `REWARD_MAX_POINTS`.
+   - `JETTONS_PER_POINT`: the same value as in the mini app (default 0.01).
+     The bot records it in the price history when `/jetton` switches a chat
+     to another jetton and resets its point price.
    - Subscriptions in Telegram Stars: `SUBSCRIPTIONS_ENABLED`, `TRIAL_DAYS`,
      `GRACE_DAYS`, with the same values as in the mini app. The mini app's
      `TELEGRAM_BOT_TOKEN` must be this bot's token: Telegram sends the payment

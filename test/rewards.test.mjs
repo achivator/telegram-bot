@@ -82,7 +82,7 @@ class Coll {
     for (const [k, v] of Object.entries(u.$inc || {})) set(doc, k, (get(doc, k) || 0) + v);
     for (const [k, v] of Object.entries(u.$set || {})) set(doc, k, v);
     for (const k of Object.keys(u.$unset || {})) { const ks = k.split("."); const o = get(doc, ks.slice(0, -1).join(".")) ?? (ks.length === 1 ? doc : undefined); if (o) delete o[ks.at(-1)]; }
-    for (const [k, v] of Object.entries(u.$push || {})) set(doc, k, [...(get(doc, k) || []), v]);
+    for (const [k, v] of Object.entries(u.$push || {})) set(doc, k, [...(get(doc, k) || []), ...(v?.$each ?? [v])]);
     for (const [k, v] of Object.entries(u.$max || {})) if (get(doc, k) == null || get(doc, k) < v) set(doc, k, v);
     if (inserting) for (const [k, v] of Object.entries(u.$setOnInsert || {})) set(doc, k, v);
   }
@@ -1127,6 +1127,108 @@ assert.equal(row(limitedRow).sent_at, null);
 await run(minutes(63));
 assert.equal(textsTo(-956).length, 1);
 console.error = originalError;
+
+// ---- Switching the reward jetton (issue #7) ----
+// A switch to another jetton drops the custom price (the platform default
+// pays), cancels a decrease still ahead, records the reset in the history
+// (protecting no lot: maturation_days 0), asks the mini app for a new price
+// and announces it through the outbox. The same jetton, however spelled,
+// changes nothing else.
+const OLD_JETTON = "EQ" + "c".repeat(46), NEW_JETTON = "EQ" + "d".repeat(46);
+const rawAddress = friendly => {
+  const bytes = Buffer.from(friendly, "base64url");
+  return `${bytes.readInt8(1)}:${bytes.subarray(2, 34).toString("hex")}`;
+};
+const SWITCH = {id: -960, type: "supergroup", title: "Switch"}, SWITCH_OWNER = 9001;
+statuses.set(SWITCH_OWNER, "creator");
+const DAY_MS = 24 * 60 * 60 * 1000;
+const aheadAt = new Date(Date.now() + 5 * DAY_MS), requestedAt = new Date(Date.now() - DAY_MS);
+const earlier = {old: "1", new: "0.5", at: new Date(Date.now() - 30 * DAY_MS), by: SWITCH_OWNER, maturation_days: 3};
+await chatsColl.insertOne({id: SWITCH.id, jetton_master: OLD_JETTON, creator: SWITCH_OWNER, point_price: "0.5",
+  point_price_pending: {price: "0.25", to_default: false, from: "0.5", symbol: "OLDT", effective_at: aheadAt,
+    requested_at: requestedAt, by: SWITCH_OWNER, maturation_days: 3},
+  point_price_history: [earlier]});
+const switchChat = () => chatsColl.docs.find(d => d.id === SWITCH.id);
+const switchRows = () => outbox.docs.filter(d => d.chat_id === SWITCH.id);
+
+await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${NEW_JETTON}`));
+assert.equal(switchChat().jetton_master, NEW_JETTON);
+assert.equal(switchChat().point_price, undefined, "the custom price is dropped");
+assert.equal(switchChat().point_price_pending, undefined, "the decrease ahead is cancelled");
+const [kept, resetEntry] = switchChat().point_price_history;
+assert.deepEqual(kept, earlier);
+assert.ok(resetEntry.at instanceof Date);
+assert.deepEqual({...resetEntry, at: null}, {old: "0.5", new: "0.01", at: null, by: SWITCH_OWNER, maturation_days: 0,
+  reason: "jetton_changed", old_jetton: OLD_JETTON, new_jetton: NEW_JETTON});
+const confirm = switchChat().point_price_confirm_required;
+assert.deepEqual({...confirm, at: null},
+  {reason: "jetton_changed", at: null, by: SWITCH_OWNER, old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, old_price: "0.5"});
+assert.equal(switchRows().length, 1);
+assert.deepEqual({...switchRows()[0], _id: null, created_at: null}, {_id: null, chat_id: SWITCH.id, type: "jetton_changed",
+  params: {old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, old_symbol: "OLDT", new_symbol: null, old_price: "0.5",
+    price_reset: true, cancelled_pending: true},
+  created_at: null, sent_at: null, claimed_at: null, attempts: 0});
+assert.equal(lastText(SWITCH.id),
+  `Reward jetton changed: ${NEW_JETTON}\n(was ${OLD_JETTON})\n\n` +
+  "The price of a point is reset to the platform default: the old price was in the old jetton. " +
+  "Set a price in the new jetton in the mini app.\nThe planned price decrease is cancelled.\n\n" +
+  "Unclaimed points are now paid in the new jetton: top up the pool with it. " +
+  "The old jetton left in the pool stays there; only the pool admin can withdraw it.");
+// the scheduler sends it to the chat, with a button to the mini app
+// (after the 429 pause the delivery tests above left behind)
+await run(minutes(64));
+assert.equal(switchRows()[0].sent_at.getTime(), minutes(64).getTime());
+assert.equal(lastText(SWITCH.id),
+  "The reward jetton of this chat has changed.\n" +
+  `Was: OLDT (${OLD_JETTON})\nNow: ${NEW_JETTON}\n\n` +
+  "The price of a point (was 0.5 OLDT) is reset to the platform default until the creator sets a new one in the mini app." +
+  "\nThe planned price decrease is cancelled.\nUnclaimed points are now paid in the new jetton.");
+assert.deepEqual(buttons(lastMessage(SWITCH.id)), ["Open the app https://t.me/achivator_bot/app"]);
+
+// The same jetton again, in its raw spelling: nothing is reset or announced.
+await chatsColl.updateOne({id: SWITCH.id}, {$set: {point_price: "0.2"}});
+await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${rawAddress(NEW_JETTON)}`));
+assert.match(lastText(SWITCH.id), /^Reward jetton set: /);
+assert.equal(switchChat().point_price, "0.2");
+assert.equal(switchChat().point_price_history.length, 2);
+assert.equal(switchRows().length, 1);
+assert.deepEqual(switchChat().point_price_confirm_required, confirm);
+
+// A decrease already due goes into the history before the reset; a chat
+// already at the default price gets no reset entry. The default comes from
+// JETTONS_PER_POINT, as in the mini app.
+process.env.JETTONS_PER_POINT = "0.10";
+const dueAt = new Date(Date.now() - DAY_MS);
+await chatsColl.updateOne({id: SWITCH.id}, {$set: {point_price_pending: {price: "0.15", to_default: false, from: "0.2",
+  symbol: null, effective_at: dueAt, requested_at: requestedAt, by: SWITCH_OWNER, maturation_days: 2}}});
+await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${OLD_JETTON}`));
+assert.deepEqual(switchChat().point_price_history.slice(2).map(h => ({...h, at: h.at.getTime()})), [
+  {old: "0.2", new: "0.15", at: dueAt.getTime(), by: SWITCH_OWNER, maturation_days: 2},
+  {old: "0.15", new: "0.1", at: switchChat().point_price_confirm_required.at.getTime(), by: SWITCH_OWNER,
+    maturation_days: 0, reason: "jetton_changed", old_jetton: rawAddress(NEW_JETTON), new_jetton: OLD_JETTON},
+]);
+assert.equal(switchRows().at(-1).params.cancelled_pending, false);
+assert.equal(switchChat().point_price_pending, undefined);
+
+const SWITCH_RU = {id: -961, type: "supergroup", title: "Смена"};
+await chatsColl.insertOne({id: SWITCH_RU.id, jetton_master: OLD_JETTON, creator: SWITCH_OWNER, lang: "ru"});
+await inChat(SWITCH_RU, speaker(SWITCH_OWNER, "ru"), command(`/jetton ${NEW_JETTON}`));
+const ruChat = chatsColl.docs.find(d => d.id === SWITCH_RU.id);
+assert.equal(ruChat.point_price_history, undefined, "no price of its own: nothing to record");
+assert.equal(ruChat.point_price_confirm_required.old_price, "0.1");
+assert.equal(lastText(SWITCH_RU.id),
+  `Жетон для наград изменён: ${NEW_JETTON}\n(был ${OLD_JETTON})\n\n` +
+  "Цена балла — стандартная цена платформы. Задайте цену в новом жетоне в мини-приложении.\n\n" +
+  "Незабранные баллы теперь выплачиваются новым жетоном — пополните им пул. " +
+  "Остаток старого жетона остаётся в пуле; вывести его может только администратор пула.");
+await run(minutes(64));
+assert.equal(lastText(SWITCH_RU.id),
+  "Жетон для наград в этом чате изменён.\n" +
+  `Был: ${OLD_JETTON}\nТеперь: ${NEW_JETTON}\n\n` +
+  "Цена балла остаётся стандартной ценой платформы, пока создатель не задаст свою в мини-приложении." +
+  "\nНезабранные баллы теперь выплачиваются новым жетоном.");
+delete process.env.JETTONS_PER_POINT;
+statuses.delete(SWITCH_OWNER);
 
 // A missing key falls back to English, an unknown key does not throw.
 assert.equal(t("de", "jettonWhere"), "Run this command in a group or channel.");

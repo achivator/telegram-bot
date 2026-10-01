@@ -349,6 +349,19 @@ export default function createBot(database, token, options) {
     );
   }
 
+  // "wc:hash" of a TON address, so EQ.../UQ.../0:... spellings of one
+  // address compare equal (the mini app compares with Address.equals, which
+  // also looks at the workchain and hash only). Anything unparseable is its
+  // own key.
+  function tonAddressKey(value) {
+    const text = String(value ?? "");
+    const raw = /^(-?[0-9]):([0-9a-fA-F]{64})$/.exec(text);
+    if (raw) return `${Number(raw[1])}:${raw[2].toLowerCase()}`;
+    const bytes = /^[A-Za-z0-9_+/=-]{48}$/.test(text) ? Buffer.from(text, "base64url") : null;
+    if (bytes?.length !== 36) return text;
+    return `${bytes.readInt8(1)}:${bytes.subarray(2, 34).toString("hex")}`;
+  }
+
   // ---- Known users ----
   // Telegram's Bot API cannot look a user up by @username, so the bot keeps
   // the usernames of the people it sees (messages, reactions, commands) to
@@ -572,16 +585,164 @@ export default function createBot(database, token, options) {
     }
 
     await handOverSubscription(ctx.chat.id, ctx.from.id);
-    await chats.updateOne(
-      {id: ctx.chat.id},
-      {$set: {jetton_master: arg, creator: ctx.from.id, title: ctx.chat.title}},
-      {upsert: true},
-    );
+    const switched = await setJetton(ctx.chat, arg, ctx.from.id);
     // points start here, and so does the free trial
     await startTrial(ctx.chat.id);
     chatConfigCache.delete(ctx.chat.id);
 
-    await ctx.reply(t(lang, "jettonSet", arg));
+    await ctx.reply(switched ? t(lang, "jettonChanged", switched) : t(lang, "jettonSet", arg));
+  }
+
+  // ---- Switching the reward jetton (issue #7) ----
+  // A custom point price is a number of the chat's jetton, so once the jetton
+  // changes it means nothing: the switch drops point_price (the platform
+  // default pays), cancels a decrease that is still ahead, and records the
+  // reset in point_price_history. Unclaimed points are paid in the new jetton
+  // from then on; the old jetton's balance stays in the pool for its admin
+  // to withdraw. The chat gets `point_price_confirm_required` so the mini app
+  // asks the creator for a price in the new jetton (the mini app clears it),
+  // and hears the switch through the outbox ("jetton_changed").
+  //
+  // The reset is not a decrease members get notice of: both prices can't be
+  // compared, being in different jettons. Its history entry snapshots
+  // maturation_days 0, so the mini app's lot pricing (a lot maturing at a
+  // decrease keeps the price before it) protects no lot at the switch: an
+  // old-jetton price must never be paid in the new jetton. `reason`,
+  // `old_jetton` and `new_jetton` are extra fields the mini app's readers
+  // ignore.
+
+  // The platform default point price as the mini app has it (the same
+  // JETTONS_PER_POINT, same fallback), canonical, or null when unreadable.
+  // Only the history entry uses it: the mini app pays its own default.
+  function platformPointPrice() {
+    const raw = process.env.JETTONS_PER_POINT || "0.01";
+    const price = decimalMul(1, raw);
+    return price !== null && isPositiveDecimal(price) ? price : null;
+  }
+
+  const sameDecimal = (a, b) => decimalSub(a, b) === "0";
+
+  // The history entry a due decrease becomes (as applyDueDecreases writes it).
+  function dueDecreaseEntry(pending) {
+    const entry = {old: pending.from, new: pending.price, at: pending.effective_at, by: pending.by};
+    if (Number.isInteger(pending.maturation_days) && pending.maturation_days >= 0) {
+      entry.maturation_days = pending.maturation_days;
+    }
+    return entry;
+  }
+
+  // What switching `chat` (the stored document) to `master` does to its price.
+  function jettonPriceReset(chat, master, by, now) {
+    const history = [];
+    const pending = chat.point_price_pending ?? null;
+    const stored = chat.point_price ?? null;
+    const platform = platformPointPrice();
+    let before = stored === null ? platform : String(stored);
+    let cancelledPending = false;
+    if (pending) {
+      // a decrease already due pays even before the bot applies it: it goes
+      // into the history first, as the mini app writes it out on a save
+      if (new Date(pending.effective_at ?? NaN).getTime() <= now.getTime() && isPrice(pending.price)) {
+        history.push(dueDecreaseEntry(pending));
+        before = String(pending.price);
+      } else {
+        cancelledPending = true;
+      }
+    }
+    if (platform === null) {
+      console.error(`chat ${chat.id}: JETTONS_PER_POINT is not a positive decimal, the price reset is not in the history`);
+    } else if (before !== null && !sameDecimal(before, platform)) {
+      history.push({
+        old: before,
+        new: platform,
+        at: now,
+        by,
+        maturation_days: 0,
+        reason: "jetton_changed",
+        old_jetton: chat.jetton_master,
+        new_jetton: master,
+      });
+    }
+    // whether a price of the chat's own (custom, or a decrease) was dropped
+    const priceReset = stored !== null || pending !== null;
+    return {history, priceReset, before, cancelledPending, symbol: pending?.symbol ?? null};
+  }
+
+  // Sets the chat's reward jetton. A switch from another jetton (not the same
+  // address spelled differently) also resets the price and queues the
+  // announcement, and returns its params; anything else returns null. The
+  // write is conditional on the price state read, so a save in the mini app
+  // or the bot applying a decrease meanwhile makes it read again.
+  async function setJetton(tgChat, master, by, now = new Date()) {
+    const plain = {jetton_master: master, creator: by, title: tgChat.title};
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const chat = await chats.findOne({id: tgChat.id});
+      const old = chat?.jetton_master || null;
+      if (!old || tonAddressKey(old) === tonAddressKey(master)) {
+        await chats.updateOne({id: tgChat.id}, {$set: plain}, {upsert: true});
+        return null;
+      }
+
+      const reset = jettonPriceReset(chat, master, by, now);
+      const update = {
+        $set: {
+          ...plain,
+          point_price_confirm_required: {
+            reason: "jetton_changed",
+            at: now,
+            by,
+            old_jetton: old,
+            new_jetton: master,
+            old_price: reset.before,
+          },
+        },
+        $unset: {point_price: "", point_price_pending: ""},
+      };
+      if (reset.history.length) update.$push = {point_price_history: {$each: reset.history}};
+      const filter = {
+        id: chat.id,
+        jetton_master: old,
+        point_price: chat.point_price ?? null,
+        ...(chat.point_price_pending
+          ? {"point_price_pending.requested_at": chat.point_price_pending.requested_at ?? null}
+          : {point_price_pending: null}),
+      };
+      if (!unwrapModifyResult(await chats.findOneAndUpdate(filter, update))) continue;
+
+      const params = {
+        old_jetton: old,
+        new_jetton: master,
+        old_symbol: reset.symbol,
+        new_symbol: null,
+        old_price: reset.before,
+        price_reset: reset.priceReset,
+        cancelled_pending: reset.cancelledPending,
+      };
+      await announcements.insertOne({
+        chat_id: chat.id,
+        type: "jetton_changed",
+        params,
+        created_at: now,
+        sent_at: null,
+        claimed_at: null,
+        attempts: 0,
+      });
+      console.log(
+        `chat ${chat.id}: reward jetton ${old} -> ${master}, point price ${reset.before} reset to the platform default` +
+          (reset.cancelledPending ? ", pending decrease cancelled" : ""),
+      );
+      return params;
+    }
+    throw new Error(`chat ${tgChat.id}: the price changed under /jetton three times, jetton not switched`);
+  }
+
+  // The chat's "jetton_changed" announcement, or null on bad params.
+  function jettonChangedMessage(lang, params) {
+    if (typeof params?.old_jetton !== "string" || typeof params?.new_jetton !== "string") return null;
+    return {
+      text: t(lang, "jettonChangedAnnouncement", params),
+      extra: {reply_markup: {inline_keyboard: [[{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}]]}},
+    };
   }
 
   // /lang shows the chat's language, /lang ru|en changes it (creator and
@@ -1360,6 +1521,7 @@ export default function createBot(database, token, options) {
 
   // {text, extra} for sendMessage, or null for an unknown type or bad params.
   function priceMessage(lang, type, params) {
+    if (type === "jetton_changed") return jettonChangedMessage(lang, params);
     const key = PRICE_MESSAGES[type];
     if (!key || !isPrice(params?.from) || !isPrice(params?.to)) return null;
     if (type !== "price_decrease_scheduled") return {text: t(lang, key, params), extra: {}};

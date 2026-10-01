@@ -57,6 +57,11 @@ function ruPointsWord(points) {
   return Number.isInteger(n) ? ruPlural(n, "балл", "балла", "баллов") : "балла";
 }
 
+// "MEME (EQ...)", or the bare address when the symbol is unknown
+function jettonLabel(address, symbol) {
+  return symbol ? `${symbol} (${address})` : address;
+}
+
 const en = {
   languageName: "English",
   member: "member",
@@ -135,6 +140,27 @@ const en = {
     "1. Open the mini app and activate the chat pool (one-time, 0.3 TON).\n" +
     "2. Top up the pool with your jettons.\n" +
     "Members will then earn points for positive reactions and claim them as jettons.",
+  // /jetton to another jetton: the reply to the creator, and the chat's
+  // announcement (the outbox row "jetton_changed"). `price_reset`: the chat
+  // had a price of its own, now dropped; `old_price` is what it was.
+  jettonChanged: ({old_jetton, new_jetton, price_reset, cancelled_pending}) =>
+    `Reward jetton changed: ${new_jetton}\n(was ${old_jetton})\n\n` +
+    (price_reset
+      ? "The price of a point is reset to the platform default: the old price was in the old jetton. "
+      : "The price of a point is the platform default. ") +
+    "Set a price in the new jetton in the mini app." +
+    (cancelled_pending ? "\nThe planned price decrease is cancelled." : "") +
+    "\n\nUnclaimed points are now paid in the new jetton: top up the pool with it. " +
+    "The old jetton left in the pool stays there; only the pool admin can withdraw it.",
+  jettonChangedAnnouncement: ({old_jetton, new_jetton, old_symbol, new_symbol, old_price, price_reset, cancelled_pending}) =>
+    "The reward jetton of this chat has changed.\n" +
+    `Was: ${jettonLabel(old_jetton, old_symbol)}\nNow: ${jettonLabel(new_jetton, new_symbol)}\n\n` +
+    (price_reset
+      ? `The price of a point (was ${old_price} ${old_symbol || "jetton"}) is reset to the platform default ` +
+        "until the creator sets a new one in the mini app."
+      : "The price of a point stays at the platform default until the creator sets one in the mini app.") +
+    (cancelled_pending ? "\nThe planned price decrease is cancelled." : "") +
+    "\nUnclaimed points are now paid in the new jetton.",
 
   verifyWhere: "Run /verify in the group you created.",
   verifyCannotCheck: "I cannot check your status here. Make sure I am an admin of this chat.",
@@ -305,6 +331,24 @@ const ru = {
     "1. Откройте мини-приложение и активируйте пул чата (один раз, 0,3 TON).\n" +
     "2. Пополните пул своими жетонами.\n" +
     "После этого участники будут получать баллы за положительные реакции и забирать их жетонами.",
+  jettonChanged: ({old_jetton, new_jetton, price_reset, cancelled_pending}) =>
+    `Жетон для наград изменён: ${new_jetton}\n(был ${old_jetton})\n\n` +
+    (price_reset
+      ? "Цена балла сброшена до стандартной цены платформы: прежняя цена была в старом жетоне. "
+      : "Цена балла — стандартная цена платформы. ") +
+    "Задайте цену в новом жетоне в мини-приложении." +
+    (cancelled_pending ? "\nЗапланированное снижение цены отменено." : "") +
+    "\n\nНезабранные баллы теперь выплачиваются новым жетоном — пополните им пул. " +
+    "Остаток старого жетона остаётся в пуле; вывести его может только администратор пула.",
+  jettonChangedAnnouncement: ({old_jetton, new_jetton, old_symbol, new_symbol, old_price, price_reset, cancelled_pending}) =>
+    "Жетон для наград в этом чате изменён.\n" +
+    `Был: ${jettonLabel(old_jetton, old_symbol)}\nТеперь: ${jettonLabel(new_jetton, new_symbol)}\n\n` +
+    (price_reset
+      ? `Цена балла (была ${ruDecimal(old_price)} ${old_symbol || "жетона"}) сброшена до стандартной цены платформы, ` +
+        "пока создатель не задаст новую в мини-приложении."
+      : "Цена балла остаётся стандартной ценой платформы, пока создатель не задаст свою в мини-приложении.") +
+    (cancelled_pending ? "\nЗапланированное снижение цены отменено." : "") +
+    "\nНезабранные баллы теперь выплачиваются новым жетоном.",
 
   verifyWhere: "Выполните /verify в группе, которую вы создали.",
   verifyCannotCheck: "Не могу проверить ваш статус. Убедитесь, что я администратор этого чата.",
