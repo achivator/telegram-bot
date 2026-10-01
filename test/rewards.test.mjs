@@ -48,7 +48,8 @@ const OPS = {
 const isOps = v => v && typeof v === "object" && !(v instanceof Date) && Object.keys(v).every(k => k in OPS);
 const test = (x, v) =>
   isOps(v) ? Object.entries(v).every(([op, arg]) => OPS[op](x, arg)) : v === null ? x == null : same(x, v);
-const matches = (doc, filter) => Object.entries(filter).every(([k, v]) => test(get(doc, k), v));
+const matches = (doc, filter) =>
+  Object.entries(filter).every(([k, v]) => (k === "$or" ? v.some(f => matches(doc, f)) : test(get(doc, k), v)));
 const dup = () => Object.assign(new Error("E11000"), {code: 11000});
 
 class Coll {
@@ -66,7 +67,9 @@ class Coll {
     const cursor = {
       sort(spec) { const [[k, dir]] = Object.entries(spec); docs.sort((a, b) => (get(a, k) < get(b, k) ? -dir : get(a, k) > get(b, k) ? dir : 0)); return cursor; },
       limit(n) { docs = docs.slice(0, n); return cursor; },
+      batchSize() { return cursor; },
       async toArray() { return docs; },
+      async *[Symbol.asyncIterator]() { yield* docs; },
     };
     return cursor;
   }
@@ -84,6 +87,7 @@ class Coll {
     for (const k of Object.keys(u.$unset || {})) { const ks = k.split("."); const o = get(doc, ks.slice(0, -1).join(".")) ?? (ks.length === 1 ? doc : undefined); if (o) delete o[ks.at(-1)]; }
     for (const [k, v] of Object.entries(u.$push || {})) set(doc, k, [...(get(doc, k) || []), ...(v?.$each ?? [v])]);
     for (const [k, v] of Object.entries(u.$max || {})) if (get(doc, k) == null || get(doc, k) < v) set(doc, k, v);
+    for (const [k, v] of Object.entries(u.$min || {})) if (get(doc, k) == null || get(doc, k) > v) set(doc, k, v);
     if (inserting) for (const [k, v] of Object.entries(u.$setOnInsert || {})) set(doc, k, v);
   }
   async upsertOrUpdate(f, u, opts = {}) {
@@ -964,11 +968,104 @@ assert.equal(sendAttempts.filter(id => id === 5001 || id === 5002).length, 1);
 assert.equal((await runDms(new Date(minutes(40).getTime() + 8000))).sent, 2);
 assert.deepEqual([dmsTo(5001).length, dmsTo(5002).length], [1, 1]);
 
-// The DM timer starts once and stops cleanly.
+// A big chat: holders are streamed and queued 500 at a time (one users
+// lookup and one unordered insertMany per batch), duplicates tolerated.
+const HUGE = -908;
+await chatsColl.insertOne({id: HUGE, title: "Huge", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+const HUGE_HOLDERS = 1100;
+rewardsColl.docs.push(...Array.from({length: HUGE_HOLDERS}, (_, i) => ({_id: `huge-${i}`, chat_id: HUGE, user_id: 70000 + i, points: 2})));
+const {insertedId: huge} = await queue(HUGE, "price_decrease_scheduled", {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT},
+  {created_at: minutes(44)});
+// one of them is queued already (a crash halfway through an earlier run)
+await dmQueue.insertOne({user_id: 70500, chat_id: HUGE, source_id: huge, kind: "price_decrease_scheduled", params: {},
+  lang: "en", created_at: minutes(44), send_after: minutes(44), sent_at: null, claimed_at: null, attempts: 0, last_error: null});
+const insertSizes = [];
+const lookupSizes = [];
+const realInsertMany = dmQueue.insertMany;
+dmQueue.insertMany = function (docs, opts) { insertSizes.push(docs.length); return realInsertMany.call(this, docs, opts); };
+const realUsersFind = usersColl.find;
+usersColl.find = function (f) { if (f.id?.$in) lookupSizes.push(f.id.$in.length); return realUsersFind.call(this, f); };
+await run(minutes(45));
+dmQueue.insertMany = realInsertMany;
+usersColl.find = realUsersFind;
+assert.deepEqual(insertSizes, [500, 500, 100]);
+assert.deepEqual(lookupSizes, [500, 500, 100]);
+assert.equal(dmRows(huge).length, HUGE_HOLDERS, "every holder once, the one already queued included");
+assert.ok(row(huge).fanned_out_at);
+await dmQueue.updateMany({source_id: huge}, {$set: {sent_at: minutes(45), skipped: "test"}});
+
+// The DM loop: an idle queue waits twice as long after each empty pass, up to
+// 30 s; new rows wake it at once, even in the middle of a pass.
+const {createDmQueue} = await import("../dm-queue.mjs");
+const loopCols = new Map();
+const loopDb = {collection: name => (loopCols.has(name) ? loopCols.get(name) : loopCols.set(name, new Coll()).get(name))};
+const delays = [];
+let armed = null;
+const fakeTimers = {
+  setTimeout(fn, ms) { delays.push(ms); armed = {fn, cleared: false, unref() {}}; return armed; },
+  clearTimeout(handle) { handle.cleared = true; },
+};
+const loopSent = [];
+const loop = createDmQueue({database: loopDb, telegram: {sendMessage: async id => loopSent.push(id)},
+  render: () => ({text: "x", extra: {}}), timers: fakeTimers, env: {}});
+const passDone = () => new Promise(resolve => setTimeout(resolve, 60)); // a pass may wait its 50 ms slot
+const fire = async () => { const handle = armed; armed = null; assert.ok(!handle.cleared); handle.fn(); await passDone(); };
+const loopRow = user_id => ({user_id, chat_id: 1, source_id: `loop-${user_id}`, kind: "k", params: {}, lang: "en"});
+loop.start();
+await passDone();
+for (let i = 0; i < 5; i++) await fire();
+assert.deepEqual(delays, [2000, 4000, 8000, 16000, 30000, 30000], "idle: backs off to the 30 s cap");
+await loop.enqueue([loopRow(1)], new Date(Date.now() - 1000));
+const idleTimer = armed;
+loop.wake();
+assert.ok(idleTimer.cleared, "wake cancels the idle wait");
+assert.equal(delays.at(-1), 0, "and runs a pass at once");
+await fire();
+assert.deepEqual(loopSent, [1]);
+assert.equal(delays.at(-1), 1000, "after a busy pass: the normal interval");
+await fire();
+assert.equal(delays.at(-1), 2000);
+// woken during a pass (which may have read the queue already): another pass
+// right after it
+armed.fn();
+await loop.enqueue([loopRow(2)], new Date(Date.now() - 1000));
+loop.wake();
+await passDone();
+assert.equal(delays.at(-1), 0);
+await fire();
+assert.deepEqual(loopSent, [1, 2]);
+const scheduledBeforeStop = delays.length;
+loop.stop();
+assert.ok(armed.cleared, "stop cancels the next pass");
+loop.wake();
+assert.ok(armed.cleared && delays.length === scheduledBeforeStop, "a stopped loop is not woken");
+
+// The bot's loop starts once and stops cleanly, and a fan-out wakes it. Every
+// pass reads the shared pause first (it may stop there: the loop runs on the
+// real clock).
+const stateColl = cols.get("bot_state");
+const realStateFind = stateColl.findOne;
+let pauseReads = 0;
+stateColl.findOne = function (f) { pauseReads++; return realStateFind.call(this, f); };
 bot.dms.start(60 * 60 * 1000);
 bot.dms.start(60 * 60 * 1000);
 await settle();
+assert.equal(pauseReads, 1, "one pass at start");
+await settle();
+assert.equal(pauseReads, 1, "then the long wait");
+const WAKE = -909;
+await chatsColl.insertOne({id: WAKE, title: "Wake", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+await giveReward(WAKE, 7901, 1);
+const {insertedId: wakeRow} = await queue(WAKE, "price_decrease_scheduled", {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT},
+  {created_at: minutes(45)});
+await run(minutes(46));
+assert.equal(dmRows(wakeRow).length, 1);
+const readsAfterFanOut = pauseReads; // the announcements read it too
+await settle();
+assert.equal(pauseReads, readsAfterFanOut + 1, "the fan-out woke the private message loop");
 bot.dms.stop();
+stateColl.findOne = realStateFind;
+await dmQueue.updateMany({source_id: wakeRow}, {$set: {sent_at: minutes(46), skipped: "test"}});
 
 // ---- Delivery failures ----
 // A 403 is final: no retries, and the chat is flagged for the mini app until

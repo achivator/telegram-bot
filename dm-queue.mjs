@@ -108,6 +108,7 @@ export function createDmQueue({
   isStale = async () => null,
   pause = createPause(database),
   env = process.env,
+  timers = {setTimeout, clearTimeout},
 }) {
   const queue = database.collection("dm_queue");
   const users = database.collection("users");
@@ -289,27 +290,72 @@ export function createDmQueue({
     return done;
   }
 
+  // ---- The loop ----
+  // A pass runs every `everyMs` while there is work. A pass that finds
+  // nothing to do (or only Telegram's pause) waits twice as long as the last
+  // one, up to DM_MAX_IDLE_MS (default 30 s, never below everyMs), so an idle
+  // bot does not query the queue every second. Rows are queued by the
+  // fan-outs, which call wake() in their process: the next pass then runs at
+  // once (rows another process queued wait at most the idle cap).
+  // The bot_state pause is still read by every pass (run()).
+  // `timers` is injectable for tests.
+  const maxIdleMs = Math.max(intervalMs, positiveNumber(env.DM_MAX_IDLE_MS, 30 * 1000));
   let timer = null;
   let running = null;
+  let started = false;
   let stopping = false;
-  function start(everyMs = intervalMs) {
-    if (timer) return;
+  let woken = false;
+  let everyMs = intervalMs;
+  let idleMs = 0; // the last idle wait, 0 after a pass that did something
+
+  function schedule(delay) {
+    timer = timers.setTimeout(tick, delay);
+    timer?.unref?.();
+  }
+  function tick() {
+    timer = null;
+    if (stopping) return;
+    woken = false;
+    running = run(new Date(), {shouldStop: () => stopping})
+      .then(done => {
+        const busy = done && (done.sent || done.skipped || done.failed);
+        idleMs = busy ? 0 : Math.min(Math.max(maxIdleMs, everyMs), idleMs ? idleMs * 2 : everyMs * 2);
+      })
+      .catch(error => console.error("private message queue failed:", error))
+      .finally(() => {
+        running = null;
+        if (stopping) return;
+        if (woken) idleMs = 0;
+        schedule(woken ? 0 : idleMs || everyMs);
+      });
+  }
+  function start(interval = intervalMs) {
+    if (started) return;
+    started = true;
     stopping = false;
-    const tick = () => {
-      if (running) return; // the previous pass is still going
-      running = run(new Date(), {shouldStop: () => stopping})
-        .catch(error => console.error("private message queue failed:", error))
-        .finally(() => (running = null));
-    };
-    timer = setInterval(tick, everyMs);
-    timer.unref();
-    tick();
+    everyMs = interval;
+    idleMs = 0;
+    // a pass from before a stop() is still going: it schedules the next one
+    if (running) woken = true;
+    else tick();
   }
   // The pass in progress stops before its next message.
   function stop() {
+    started = false;
     stopping = true;
-    clearInterval(timer);
+    if (timer) timers.clearTimeout(timer);
     timer = null;
+  }
+  // New rows were queued: run a pass now instead of after the idle wait.
+  function wake() {
+    if (!started) return;
+    if (running) {
+      woken = true; // the pass in progress may have missed them
+      return;
+    }
+    if (timer) timers.clearTimeout(timer);
+    idleMs = 0;
+    schedule(0);
   }
 
   return {
@@ -320,6 +366,7 @@ export function createDmQueue({
     run,
     start,
     stop,
+    wake,
     limits: {ratePerSec, intervalMs, budget},
   };
 }

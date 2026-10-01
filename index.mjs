@@ -221,6 +221,9 @@ export default function createBot(database, token, options) {
   // (claim rules) per receiver; these keep that query indexed.
   reactionPoints.createIndex({chat_id: 1, receiver_id: 1, date: 1}).catch(console.error);
   grants.createIndex({chat_id: 1, user_id: 1, date: 1}).catch(console.error);
+  // every write to rewards, and the holders of a chat a price decrease
+  // reminds (fanOutScheduled)
+  rewards.createIndex({chat_id: 1, user_id: 1}).catch(console.error);
   // who wrote a reacted message, and how many messages a reactor has written
   messages.createIndex({chat_id: 1, message_id: 1}).catch(console.error);
   messages.createIndex({chat_id: 1, user_id: 1}).catch(console.error);
@@ -1468,6 +1471,10 @@ export default function createBot(database, token, options) {
   // before a price decrease, and the chat not hearing it is all the more
   // reason to write to them.
   const announcements = database.collection("announcements");
+  // The pass does not back off while idle, unlike the private message
+  // queue: its rows come from the mini app, another process that cannot wake
+  // it, and a decrease must apply close to effective_at. Idle, a pass costs a
+  // handful of indexed queries a minute.
   const ANNOUNCE_INTERVAL_MS =
     Number(process.env.ANNOUNCE_INTERVAL_MS) > 0 ? Number(process.env.ANNOUNCE_INTERVAL_MS) : 60 * 1000;
   const ANNOUNCE_MAX_ATTEMPTS = 5;
@@ -1682,6 +1689,7 @@ export default function createBot(database, token, options) {
   // {source_id, user_id}.
   const FAN_OUT_TYPES = new Set(["price_decrease_scheduled", "price_decrease_cancelled"]);
   const USER_LOOKUP_CHUNK = 1000;
+  const FAN_OUT_BATCH = 500;
 
   // one 429 pause for the announcements and the private messages
   const telegramPause = createPause(database);
@@ -1749,36 +1757,50 @@ export default function createBot(database, token, options) {
       return 0;
     }
 
-    const holders = (
-      await rewards
-        .find({chat_id: row.chat_id, points: {$gt: 0}}, {projection: {user_id: 1, points: 1, claimed_points: 1}})
-        .toArray()
-    )
-      .map(doc => ({user_id: doc.user_id, points: decimalSub(doc.points, doc.claimed_points || 0)}))
-      .filter(holder => isPositiveDecimal(holder.points));
-    if (holders.length === 0) return 0;
-
-    const info = await recipientsInfo(row.chat_id, holders.map(holder => holder.user_id));
+    // Holders are streamed FAN_OUT_BATCH at a time: a big chat's holders
+    // never sit in memory at once, and each batch costs one users lookup and
+    // one unordered insertMany (enqueue).
     const {from, to, symbol = null, effective_at} = row.params;
-    const queued = holders
-      .filter(holder => !info(holder.user_id).blocked)
-      .map(holder => ({
-        user_id: holder.user_id,
-        chat_id: row.chat_id,
-        source_id: row._id,
-        kind: row.type,
-        params: {
-          chat_title: chat.title || null,
-          from,
-          to,
-          symbol,
-          effective_at: new Date(effective_at),
-          points: holder.points,
-          estimate: decimalMul(holder.points, from),
-        },
-        lang: info(holder.user_id).lang,
-      }));
-    return dms.enqueue(queued, now);
+    let queued = 0;
+    async function queueBatch(docs) {
+      const holders = docs
+        .map(doc => ({user_id: doc.user_id, points: decimalSub(doc.points, doc.claimed_points || 0)}))
+        .filter(holder => isPositiveDecimal(holder.points));
+      if (holders.length === 0) return;
+      const info = await recipientsInfo(row.chat_id, holders.map(holder => holder.user_id));
+      const batch = holders
+        .filter(holder => !info(holder.user_id).blocked)
+        .map(holder => ({
+          user_id: holder.user_id,
+          chat_id: row.chat_id,
+          source_id: row._id,
+          kind: row.type,
+          params: {
+            chat_title: chat.title || null,
+            from,
+            to,
+            symbol,
+            effective_at: new Date(effective_at),
+            points: holder.points,
+            estimate: decimalMul(holder.points, from),
+          },
+          lang: info(holder.user_id).lang,
+        }));
+      queued += await dms.enqueue(batch, now);
+    }
+
+    const cursor = rewards
+      .find({chat_id: row.chat_id, points: {$gt: 0}}, {projection: {user_id: 1, points: 1, claimed_points: 1}})
+      .batchSize(FAN_OUT_BATCH);
+    let docs = [];
+    for await (const doc of cursor) {
+      docs.push(doc);
+      if (docs.length < FAN_OUT_BATCH) continue;
+      await queueBatch(docs);
+      docs = [];
+    }
+    await queueBatch(docs);
+    return queued;
   }
 
   // Only the members who got, or are getting, the reminder of the decrease
@@ -1800,26 +1822,42 @@ export default function createBot(database, token, options) {
       {source_id: scheduled._id, sent_at: null, claimed_at: null, attempts: {$not: {$gte: DM_MAX_ATTEMPTS}}},
       {$set: {sent_at: now, skipped: "cancelled"}},
     );
-    const reminded = (await dms.collection.find({source_id: scheduled._id}).toArray())
-      // delivered, or being sent right now
-      .filter(dm => (dm.sent_at && !dm.skipped) || (!dm.sent_at && dm.claimed_at))
-      .map(dm => dm.user_id);
-    if (reminded.length === 0) return 0;
-
     const chat = await chats.findOne({id: row.chat_id});
-    const info = await recipientsInfo(row.chat_id, reminded);
     const {from, to = null, symbol = null} = row.params;
-    const queued = reminded
-      .filter(user_id => !info(user_id).blocked)
-      .map(user_id => ({
-        user_id,
-        chat_id: row.chat_id,
-        source_id: row._id,
-        kind: row.type,
-        params: {chat_title: chat?.title || null, from, to, symbol},
-        lang: info(user_id).lang,
-      }));
-    return dms.enqueue(queued, now);
+    let queued = 0;
+    async function queueBatch(dmRows) {
+      const reminded = dmRows
+        // delivered, or being sent right now
+        .filter(dm => (dm.sent_at && !dm.skipped) || (!dm.sent_at && dm.claimed_at))
+        .map(dm => dm.user_id);
+      if (reminded.length === 0) return;
+      const info = await recipientsInfo(row.chat_id, reminded);
+      const batch = reminded
+        .filter(user_id => !info(user_id).blocked)
+        .map(user_id => ({
+          user_id,
+          chat_id: row.chat_id,
+          source_id: row._id,
+          kind: row.type,
+          params: {chat_title: chat?.title || null, from, to, symbol},
+          lang: info(user_id).lang,
+        }));
+      queued += await dms.enqueue(batch, now);
+    }
+
+    // streamed like fanOutScheduled
+    const cursor = dms.collection
+      .find({source_id: scheduled._id}, {projection: {user_id: 1, sent_at: 1, skipped: 1, claimed_at: 1}})
+      .batchSize(FAN_OUT_BATCH);
+    let dmRows = [];
+    for await (const dm of cursor) {
+      dmRows.push(dm);
+      if (dmRows.length < FAN_OUT_BATCH) continue;
+      await queueBatch(dmRows);
+      dmRows = [];
+    }
+    await queueBatch(dmRows);
+    return queued;
   }
 
   // Queues the private messages of a sent announcement and marks it done;
@@ -1829,7 +1867,10 @@ export default function createBot(database, token, options) {
       const queued =
         row.type === "price_decrease_scheduled" ? await fanOutScheduled(row, now) : await fanOutCancelled(row, now);
       await announcements.updateOne({_id: row._id}, {$set: {fanned_out_at: now}, $unset: {fanout_due: ""}});
-      if (queued > 0) console.log(`announcement ${row._id} (${row.type}): ${queued} private messages queued`);
+      if (queued > 0) {
+        console.log(`announcement ${row._id} (${row.type}): ${queued} private messages queued`);
+        dms.wake(); // send them now, not after the queue's idle wait
+      }
       return true;
     } catch (error) {
       console.error(`announcement ${row._id} (${row.type}): queuing private messages failed:`, error);
@@ -1969,9 +2010,10 @@ export default function createBot(database, token, options) {
   telegraf.announcements = {run: runAnnouncements, start: startAnnouncements, stop: stopAnnouncements};
   // the hourly subscription pass on its own, for tests
   telegraf.subscriptions = {run: runSubscriptions};
-  // The private messages queue, on its own timer (DM_INTERVAL_MS) started by
-  // standalone.mjs: `bot.dms.start()`.
-  telegraf.dms = {run: dms.run, start: dms.start, stop: dms.stop, limits: dms.limits};
+  // The private messages queue, on its own timer (DM_INTERVAL_MS, backing
+  // off to DM_MAX_IDLE_MS while idle) started by standalone.mjs:
+  // `bot.dms.start()`.
+  telegraf.dms = {run: dms.run, start: dms.start, stop: dms.stop, wake: dms.wake, limits: dms.limits};
 
   telegraf.catch(console.error);
 

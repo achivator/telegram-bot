@@ -60,7 +60,8 @@ bot.launch({ ...botOptions, allowedUpdates });
 // decreases that fall due (ANNOUNCE_INTERVAL_MS).
 bot.announcements.start();
 // Private messages to members (price decrease reminders), at most
-// DM_RATE_PER_SEC per second, checked every DM_INTERVAL_MS.
+// DM_RATE_PER_SEC per second, checked every DM_INTERVAL_MS while there is
+// work and up to every DM_MAX_IDLE_MS while there is none.
 bot.dms.start();
 
 // Enable graceful stop
