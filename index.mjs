@@ -85,6 +85,8 @@ async function giveAchievement(ctx, dbCollection, achievement, {user = ctx.from,
   try {
     const chat_id = econChatId(ctx);
     const user_id = user.id;
+    // Telegram's id of the message that earned it (stored below as messageKey)
+    const sourceMessageId = message_id ?? ctx.message?.message_id ?? ctx.messageReaction?.message_id;
 
     const existingAchievement = await dbCollection.findOne({
       chat_id,
@@ -100,7 +102,7 @@ async function giveAchievement(ctx, dbCollection, achievement, {user = ctx.from,
       user_id,
       type: achievement,
       date: Date.now(),
-      message_id: messageKey(ctx, message_id ?? ctx.message?.message_id ?? ctx.messageReaction?.message_id),
+      message_id: messageKey(ctx, sourceMessageId),
       collection: NFT_COLLECTION,
     });
 
@@ -108,8 +110,14 @@ async function giveAchievement(ctx, dbCollection, achievement, {user = ctx.from,
 
     // the achievement name is also the medal's id, only the sentence is translated
     const lang = await ctx.state.lang();
+    // A reply to the message that earned it: telegraf only keeps forum topics
+    // on its own, so in a channel's discussion group a plain message would land
+    // in the group's main feed, away from the comment thread the member wrote in.
+    const reply = sourceMessageId
+      ? {reply_parameters: {message_id: sourceMessageId, allow_sending_without_reply: true}}
+      : {};
     ctx
-      .sendMessage(t(lang, "achievementUnlocked", mentionUser(user, lang), achievement, MINI_APP_URL))
+      .sendMessage(t(lang, "achievementUnlocked", mentionUser(user, lang), achievement, MINI_APP_URL), reply)
       .then(botReply => setTimeout(() => ctx.deleteMessage(botReply.message_id).catch(console.error), 30000))
       .catch(console.error);
 
