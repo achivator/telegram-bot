@@ -40,6 +40,15 @@ export function decimalMul(a, b) {
   return formatDecimal({digits: x.digits * y.digits, scale: x.scale + y.scale});
 }
 
+// decimalAdd("0.1", 0.2) === "0.3"; null when either side is not a decimal.
+export function decimalAdd(a, b) {
+  const x = parseDecimal(a);
+  const y = parseDecimal(b);
+  if (!x || !y) return null;
+  const [dx, dy, scale] = align(x, y);
+  return formatDecimal({digits: dx + dy, scale});
+}
+
 // decimalSub(10, 2.5) === "7.5"; null when either side is not a decimal.
 export function decimalSub(a, b) {
   const x = parseDecimal(a);

@@ -4,7 +4,7 @@ import {channelPost, message} from "telegraf/filters";
 import {mention} from "telegraf/format";
 import {LANGUAGES, langFromCode, t} from "./i18n.mjs";
 import {classifyTelegramError, createDmQueue, createPause, DM_MAX_ATTEMPTS} from "./dm-queue.mjs";
-import {decimalMul, decimalSub, isPositiveDecimal} from "./decimal.mjs";
+import {decimalAdd, decimalMul, decimalSub, isPositiveDecimal} from "./decimal.mjs";
 import {parseSubscriptionPayload, serviceState, subscriptionConfig} from "./subscription.mjs";
 import {
   chatMaturationDays,
@@ -58,6 +58,22 @@ function normalizeEmoji(emoji) {
   return String(emoji).replace(/\uFE0F/g, "");
 }
 
+// The id the economy of the update's chat is kept under: the chat's own id,
+// or for the supergroup of an upgraded group the old group's id (set by the
+// first middleware, see "Group -> supergroup migration").
+function econChatId(ctx) {
+  return ctx.econChatId ?? ctx.chat?.id;
+}
+
+// A message id as stored under the economy id (messages, reaction_points,
+// grants.source_message_id, achievements). A supergroup numbers its messages
+// anew, so under its old group's id they could meet the group's own ids; the
+// supergroup's are stored negated (Telegram's are always positive), which
+// keeps them apart without touching the unique indexes on them.
+function messageKey(ctx, message_id) {
+  return Number.isSafeInteger(message_id) && message_id > 0 && econChatId(ctx) !== ctx.chat?.id ? -message_id : message_id;
+}
+
 function mentionUser(user, lang) {
   return mention(user.first_name || user.username || t(lang, "member"), user);
 }
@@ -67,7 +83,7 @@ function mentionUser(user, lang) {
 // an unhandled rejection terminates Node.
 async function giveAchievement(ctx, dbCollection, achievement, {user = ctx.from, message_id} = {}) {
   try {
-    const chat_id = ctx.chat.id;
+    const chat_id = econChatId(ctx);
     const user_id = user.id;
 
     const existingAchievement = await dbCollection.findOne({
@@ -84,7 +100,7 @@ async function giveAchievement(ctx, dbCollection, achievement, {user = ctx.from,
       user_id,
       type: achievement,
       date: Date.now(),
-      message_id: message_id ?? ctx.message?.message_id ?? ctx.messageReaction?.message_id,
+      message_id: messageKey(ctx, message_id ?? ctx.message?.message_id ?? ctx.messageReaction?.message_id),
       collection: NFT_COLLECTION,
     });
 
@@ -160,8 +176,10 @@ export default function createBot(database, token, options) {
       lang: LANGUAGES.includes(chat?.lang) ? chat.lang : null,
       trial_started_at: chat?.trial_started_at ?? null,
       paid_until: chat?.paid_until ?? null,
-      // where the chat's announcements go since it became a supergroup
-      migrated_to_chat_id: chat?.migrated_to_chat_id ?? null,
+      // where the chat's messages go since it became a supergroup (null:
+      // its own id); migrated_to_chat_id alone is a move recorded before the
+      // alias existed, or one an operator has to review
+      telegram_chat_id: chat?.telegram_chat_id ?? chat?.migrated_to_chat_id ?? null,
     };
     chatConfigCache.set(chat_id, {value, expiresAt: Date.now() + CHAT_CONFIG_TTL_MS});
     return value;
@@ -197,7 +215,7 @@ export default function createBot(database, token, options) {
     const userLang = langFromCode(ctx.from?.language_code);
     if (!ctx.chat || ctx.chat.type === "private") return userLang;
     // a reply in the wrong language beats no reply
-    const config = await getChatConfig(ctx.chat.id).catch(error => {
+    const config = await getChatConfig(econChatId(ctx)).catch(error => {
       console.error("chat language lookup failed:", error);
       return null;
     });
@@ -271,7 +289,7 @@ export default function createBot(database, token, options) {
   async function accrueReactionRewards(ctx, reactionsToAdd, reactionsToRemove, receiver) {
     const positiveAdd = reactionsToAdd.filter(reaction => POSITIVE_REACTIONS.has(normalizeEmoji(reaction)));
     const positiveRemove = reactionsToRemove.filter(reaction => POSITIVE_REACTIONS.has(normalizeEmoji(reaction)));
-    const chat_id = ctx.chat.id;
+    const chat_id = econChatId(ctx);
     const reactor_id = ctx.from.id;
     const noReward = reason =>
       console.log(`no reward: ${reason} (chat ${chat_id}, message ${receiver?.message_id}, from ${reactor_id})`);
@@ -486,12 +504,13 @@ export default function createBot(database, token, options) {
       return;
     }
 
-    const config = await getChatConfig(ctx.chat.id);
+    const chat_id = econChatId(ctx);
+    const config = await getChatConfig(chat_id);
     if (!config.jetton_master) {
       await ctx.reply(t(lang, "rewardNoJetton"));
       return;
     }
-    if (!(await chatService(ctx.chat.id)).accrues) {
+    if (!(await chatService(chat_id)).accrues) {
       await ctx.reply(t(lang, "subscriptionInactive"));
       return;
     }
@@ -540,19 +559,19 @@ export default function createBot(database, token, options) {
 
     // channels are not auto-registered by the message handler
     await chats.updateOne(
-      {id: ctx.chat.id},
-      {$setOnInsert: {id: ctx.chat.id, title: ctx.chat.title || null}},
+      {id: chat_id},
+      {$setOnInsert: {id: chat_id, title: ctx.chat.title || null}},
       {upsert: true},
     );
 
     const {grant, duplicate} = await applyGrant({
-      chat_id: ctx.chat.id,
+      chat_id,
       user_id: target.id,
       points,
       reason: args.slice(1).join(" ").slice(0, 200) || null,
       source: ctx.from.is_bot ? "bot-command" : "admin-command",
       granted_by: ctx.from.id,
-      source_message_id: msg.message_id,
+      source_message_id: messageKey(ctx, msg.message_id),
     });
 
     if (duplicate) return; // same message already granted, stay silent
@@ -582,9 +601,10 @@ export default function createBot(database, token, options) {
       return;
     }
 
+    const chat_id = econChatId(ctx);
     const arg = ((ctx.message || ctx.channelPost).text || "").split(/\s+/)[1];
     if (!arg) {
-      const chat = await chats.findOne({id: ctx.chat.id});
+      const chat = await chats.findOne({id: chat_id});
       await ctx.reply(chat?.jetton_master ? t(lang, "jettonCurrent", chat.jetton_master) : t(lang, "jettonNotSet"));
       return;
     }
@@ -594,11 +614,12 @@ export default function createBot(database, token, options) {
       return;
     }
 
-    await handOverSubscription(ctx.chat.id, ctx.from.id);
-    const switched = await setJetton(ctx.chat, arg, ctx.from.id);
+    await handOverSubscription(chat_id, ctx.from.id);
+    // the economy's document, with the title the chat has now
+    const switched = await setJetton({id: chat_id, title: ctx.chat.title}, arg, ctx.from.id);
     // points start here, and so does the free trial
-    await startTrial(ctx.chat.id);
-    chatConfigCache.delete(ctx.chat.id);
+    await startTrial(chat_id);
+    chatConfigCache.delete(chat_id);
 
     await ctx.reply(switched ? t(lang, "jettonChanged", switched) : t(lang, "jettonSet", arg));
   }
@@ -790,8 +811,9 @@ export default function createBot(database, token, options) {
     }
 
     const arg = ((ctx.message || ctx.channelPost).text || "").split(/\s+/)[1]?.toLowerCase();
+    const chat_id = econChatId(ctx);
     if (!arg) {
-      const config = await getChatConfig(ctx.chat.id);
+      const config = await getChatConfig(chat_id);
       const current = config.lang ? t(lang, "langCurrent", t(config.lang, "languageName")) : t(lang, "langNotSet");
       await ctx.reply(`${current}\n${t(lang, "langUsage")}`);
       return;
@@ -811,16 +833,16 @@ export default function createBot(database, token, options) {
     }
 
     if (arg === "auto") {
-      await chats.updateOne({id: ctx.chat.id}, {$unset: {lang: ""}});
+      await chats.updateOne({id: chat_id}, {$unset: {lang: ""}});
     } else {
       await chats.updateOne(
-        {id: ctx.chat.id},
+        {id: chat_id},
         {$set: {lang: arg}, $setOnInsert: {title: ctx.chat.title || null}},
         {upsert: true},
       );
     }
-    chatConfigCache.delete(ctx.chat.id);
-    console.log(`chat ${ctx.chat.id} language set to ${arg} by ${ctx.from?.id ?? "a channel post"}`);
+    chatConfigCache.delete(chat_id);
+    console.log(`chat ${chat_id} language set to ${arg} by ${ctx.from?.id ?? "a channel post"}`);
 
     if (arg === "auto") {
       await ctx.reply(t(langFromCode(ctx.from?.language_code), "langAuto"));
@@ -940,6 +962,13 @@ export default function createBot(database, token, options) {
     }
   }
 
+  // Before anything reads or writes by chat: the economy id of the update's
+  // chat (econChatId), the old group's id in an upgraded group's supergroup.
+  telegraf.use(async (ctx, next) => {
+    if (ctx.chat) ctx.econChatId = await economyChatId(ctx.chat);
+    return next();
+  });
+
   // Every reply of an update goes out in one language, resolved on first use:
   // `await ctx.state.lang()`.
   telegraf.use((ctx, next) => {
@@ -991,54 +1020,372 @@ export default function createBot(database, token, options) {
     await ctx.reply(t(await ctx.state.lang(), "migrationCompleted"));
   });
 
-  // ---- Group -> supergroup migration ----
-  // Telegram upgrades a group to a supergroup under a new chat id: the group
-  // gets a service message with `migrate_to_chat_id`, the supergroup one
-  // with `migrate_from_chat_id`, and a send to the old id fails with 400 and
-  // `parameters.migrate_to_chat_id` (postToChat). Whichever the bot sees
-  // first records the move; /migrate above is an unrelated one-off.
+  // ---- Group -> supergroup migration (issue #10) ----
+  // Telegram upgrades a group to a supergroup under a new chat id. The old id
+  // is dead from then on (a send to it fails with 400 and
+  // `parameters.migrate_to_chat_id`), and a supergroup never migrates again,
+  // so a chat has at most two ids:
+  //   - its economy id, the OLD one, for good: the `chat_id` of everything
+  //     the bot and the mini app store (settings, prices, rewards, grants,
+  //     paid reactions, statistics, achievements, payments, the outbox and
+  //     the private message rows), the id the chat's TON pool is derived
+  //     from on-chain (ChatPool(master, chatId, key)) and its vouchers carry.
+  //     The pool knows nothing about Telegram: nothing moves on-chain.
+  //   - its telegram id, the NEW one: where the bot posts and where the bot
+  //     and the mini app check membership and admin rights.
+  // Updates from the supergroup carry the new id: the first middleware puts
+  // the economy id in `ctx.econChatId` (economyChatId) and every read or
+  // write by chat uses it, while replies go to the update's chat as always.
+  // What the bot posts on its own (the outbox, subscription notices) goes to
+  // telegramChatId(). /jetton, /lang, /reward and /verify in the supergroup
+  // act on the economy; admin and creator checks ask the supergroup.
   //
-  // Only delivery follows the chat: announcements are posted to
-  // `migrated_to_chat_id` (drainOutbox). Everything economic stays keyed by
-  // the old id (settings, prices, rewards, grants, paid reactions,
-  // payments, the outbox and private message rows), because the chat's TON
-  // pool is derived on-chain from that id and the mini app's claims, mints
-  // and counters are keyed by it; moving points to an id without a pool
-  // would strand the pool's funds. The old document gets
-  // `migrated_to_chat_id`, `migrated_at` and `migration_needs_review` for
-  // the operator, the new one (created if missing, never overwritten)
-  // `migrated_from_chat_id`. Recording it twice changes nothing.
-  async function migrateChat(from, to, now = new Date()) {
-    if (!from || !to || from === to) return;
+  // Fields: the new chat's document gets `economy_chat_id` (the alias) and
+  // `migrated_from_chat_id`; the old one `telegram_chat_id`,
+  // `migrated_to_chat_id`, `migrated_at` and `migrated_automatically_at`.
+  //
+  // The alias hands a pool's economy to another chat, so only Telegram can
+  // create it: the service messages (`migrate_to_chat_id` in the old group,
+  // `migrate_from_chat_id` in the new one; the webhook only takes updates
+  // that carry its secret token, env.mjs) or a 400 with migrate_to_chat_id
+  // on a send, and then only once getChat(old id) answers with that same 400
+  // naming the new id. Never anything a user types. Each claim is a
+  // `chat_migrations` row
+  //   {_id: "<old>><new>", from, to, source, seen_at, attempts, retry_at,
+  //    last_error, confirmed_at, aliased, conflict, rejected_at}
+  // Telegram not confirming it yet (an error, or getChat still answering
+  // for the old group) is retried with backoff by the announcements pass, up
+  // to MIGRATION_MAX_ATTEMPTS; getChat naming another chat rejects it. Moves
+  // recorded before confirmation existed (`migrated_to_chat_id` without
+  // `telegram_chat_id`) are confirmed the same way on a process's first pass.
+  //
+  // A new id with money of its own (claims or Stars payments under it, or
+  // another reward jetton set there) is not aliased: the old chat keeps
+  // `migration_needs_review` with `migration_review_reason` for an operator,
+  // and only its posts follow the chat, as before the alias existed.
+  //
+  // Whatever was written under the new id before the alias (the supergroup
+  // was active before the bot heard of the upgrade, or in the moment another
+  // process still had the new id cached as its own) is merged into the
+  // economy (mergeEarlyActivity): at activation, and again on every pass for
+  // MIGRATION_REMERGE_MS after it. /migrate below is an unrelated one-off.
+  const migrations = database.collection("chat_migrations");
+  migrations.createIndex({confirmed_at: 1, rejected_at: 1, retry_at: 1}).catch(console.error);
+  const MIGRATION_MAX_ATTEMPTS = 8;
+  const MIGRATION_RETRY_MS = 60 * 1000; // doubling: 1, 2, 4 ... 64 minutes
+  const MIGRATION_REMERGE_MS = 10 * 60 * 1000;
+  const MIGRATION_BATCH = 20;
+
+  // A supergroup id -> {value: its economy id, expiresAt}. An alias never
+  // changes, so it is kept; "no alias" may end any moment (another process
+  // activates it), so it is asked again after ALIAS_MISS_TTL_MS, well within
+  // MIGRATION_REMERGE_MS.
+  const ALIAS_MISS_TTL_MS = 60 * 1000;
+  const MAX_CACHED_ALIASES = 50000;
+  const economyIds = new Map();
+
+  function rememberEconomyId(id, alias) {
+    if (economyIds.size >= MAX_CACHED_ALIASES) economyIds.clear();
+    economyIds.set(id, {value: alias ?? id, expiresAt: alias !== null ? Infinity : Date.now() + ALIAS_MISS_TTL_MS});
+  }
+
+  // Only a supergroup can be the new id of a group.
+  async function economyChatId(chat) {
+    if (chat?.type !== "supergroup") return chat?.id;
+    const cached = economyIds.get(chat.id);
+    if (cached && cached.expiresAt > Date.now()) return cached.value;
+    const doc = await chats.findOne({id: chat.id}, {projection: {economy_chat_id: 1}});
+    const alias = Number.isSafeInteger(doc?.economy_chat_id) ? doc.economy_chat_id : null;
+    rememberEconomyId(chat.id, alias);
+    return alias ?? chat.id;
+  }
+
+  // Where the chat with economy id `chat_id` is posted to.
+  async function telegramChatId(chat_id) {
+    return (await getChatConfig(chat_id)).telegram_chat_id ?? chat_id;
+  }
+
+  // Whether Telegram says group `from` became supergroup `to`: {ok}, or
+  // {final} when it names another chat, else a reason to ask again later.
+  async function telegramConfirmsMigration(from, to) {
+    try {
+      await telegraf.telegram.getChat(from);
+      return {ok: false, final: false, reason: `getChat(${from}) answers for the group itself`};
+    } catch (error) {
+      const outcome = classifyTelegramError(error, CHAT_UNREACHABLE);
+      if (outcome.kind !== "migrated") return {ok: false, final: false, reason: outcome.description};
+      if (outcome.chatId === to) return {ok: true};
+      return {ok: false, final: true, reason: `getChat(${from}) answers: upgraded to ${outcome.chatId}`};
+    }
+  }
+
+  // Why the new id must not take over the old economy, or null.
+  async function economyConflict(oldDoc, newDoc, to) {
+    if (newDoc?.economy_chat_id != null && newDoc.economy_chat_id !== oldDoc.id) {
+      return `chat ${to} already earns into ${newDoc.economy_chat_id}`;
+    }
+    if (oldDoc.economy_chat_id != null) return `chat ${oldDoc.id} is itself the supergroup of ${oldDoc.economy_chat_id}`;
+    if (oldDoc.telegram_chat_id != null && oldDoc.telegram_chat_id !== to) {
+      return `chat ${oldDoc.id} already moved to ${oldDoc.telegram_chat_id}`;
+    }
+    if (newDoc?.economy_chat_id === oldDoc.id) return null; // active already
+    const jetton = newDoc?.jetton_master;
+    if (jetton && (!oldDoc.jetton_master || tonAddressKey(jetton) !== tonAddressKey(oldDoc.jetton_master))) {
+      return `chat ${to} set reward jetton ${jetton} of its own`;
+    }
+    if (await database.collection("claims").countDocuments({chat_id: to}, {limit: 1})) {
+      return `members of chat ${to} already claimed from a pool of its own`;
+    }
+    if (await payments.countDocuments({chat_id: to}, {limit: 1})) return `chat ${to} has Stars payments of its own`;
+    return null;
+  }
+
+  // Records the confirmed move and, unless the new id has an economy of its
+  // own, activates the alias and merges the new id's early activity.
+  // Idempotent. Resolves to {aliased, conflict}.
+  async function activateMigration(from, to, now = new Date()) {
+    // the move itself: posts follow the chat whatever comes next
     await chats.updateOne({id: to}, {$setOnInsert: {id: to}}, {upsert: true});
     await chats.updateOne({id: to, migrated_from_chat_id: null}, {$set: {migrated_from_chat_id: from}});
     await chats.updateOne({id: from}, {$setOnInsert: {id: from}}, {upsert: true});
     const first = unwrapModifyResult(
-      await chats.findOneAndUpdate(
-        {id: from, migrated_to_chat_id: null},
-        {$set: {migrated_to_chat_id: to, migrated_at: now, migration_needs_review: true}},
-      ),
+      await chats.findOneAndUpdate({id: from, migrated_to_chat_id: null}, {$set: {migrated_to_chat_id: to, migrated_at: now}}),
     );
+    await chats.updateOne({id: from, migrated_at: null}, {$set: {migrated_at: now}});
     chatConfigCache.delete(from);
     chatConfigCache.delete(to);
-    if (first) {
-      console.error(
-        `chat ${from} migrated to ${to}; economic data and the TON pool stay keyed by ${from}` +
-          " — see issue #10 (migration_needs_review)",
+
+    const [oldDoc, newDoc] = await Promise.all([chats.findOne({id: from}), chats.findOne({id: to})]);
+    const conflict = await economyConflict(oldDoc, newDoc, to);
+    if (conflict) {
+      await chats.updateOne({id: from}, {$set: {migration_needs_review: true, migration_review_reason: conflict}});
+      if (first || oldDoc.migration_review_reason !== conflict) {
+        console.error(`chat ${from} migrated to ${to}, not merged: ${conflict}; an operator has to review it (issue #10)`);
+      }
+      return {aliased: false, conflict};
+    }
+
+    await chats.updateOne({id: to, economy_chat_id: null}, {$set: {economy_chat_id: from}});
+    const activated = unwrapModifyResult(
+      await chats.findOneAndUpdate(
+        {id: from, telegram_chat_id: null},
+        {$set: {telegram_chat_id: to, migrated_automatically_at: now}, $unset: {migration_needs_review: "", migration_review_reason: ""}},
+      ),
+    );
+    rememberEconomyId(to, from);
+    chatConfigCache.delete(from);
+    chatConfigCache.delete(to);
+    if (activated) console.log(`chat ${from} migrated to ${to}: the supergroup now earns into ${from} and its TON pool`);
+    await mergeEarlyActivity(from, to);
+    return {aliased: true, conflict: null};
+  }
+
+  // Asks Telegram about a claimed move and acts on the answer; true once
+  // confirmed (aliased or not).
+  async function confirmMigration(row, now = new Date()) {
+    const answer = await telegramConfirmsMigration(row.from, row.to);
+    if (answer.ok) {
+      const {aliased, conflict} = await activateMigration(row.from, row.to, now);
+      await migrations.updateOne(
+        {_id: row._id},
+        {$set: {confirmed_at: now, aliased, conflict, last_error: null, retry_at: null}, $inc: {attempts: 1}},
       );
+      return true;
+    }
+    const attempts = (row.attempts || 0) + 1;
+    const giveUp = answer.final || attempts >= MIGRATION_MAX_ATTEMPTS;
+    await migrations.updateOne(
+      {_id: row._id},
+      {
+        $set: {
+          attempts,
+          last_error: answer.reason,
+          retry_at: giveUp ? null : new Date(now.getTime() + MIGRATION_RETRY_MS * 2 ** (attempts - 1)),
+          rejected_at: giveUp ? now : null,
+        },
+      },
+    );
+    console.error(
+      `chat ${row.from} -> ${row.to} (${row.source}): not confirmed by Telegram (${answer.reason})` +
+        (giveUp ? ", rejected" : ", asking again later"),
+    );
+    return false;
+  }
+
+  // A move as Telegram reported it (`source`); confirmed before anything
+  // depends on it. Never rejects.
+  async function noteMigration(from, to, source, now = new Date()) {
+    try {
+      if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from === to) return false;
+      const _id = `${from}>${to}`;
+      await migrations.updateOne(
+        {_id},
+        {$setOnInsert: {from, to, source, seen_at: now, attempts: 0, confirmed_at: null, rejected_at: null}},
+        {upsert: true},
+      );
+      const row = await migrations.findOne({_id});
+      if (row.confirmed_at) return true;
+      return await confirmMigration(row, now);
+    } catch (error) {
+      console.error(`chat ${from}: recording its migration to ${to} failed:`, error);
+      return false;
+    }
+  }
+
+  // The announcements pass: moves recorded before confirmation existed (once
+  // per process), claims due for another try, and the merge again for moves
+  // aliased in the last MIGRATION_REMERGE_MS. Resolves to how many it
+  // confirmed.
+  let recordedMovesQueued = false;
+  async function runMigrations(now = new Date()) {
+    if (!recordedMovesQueued) {
+      const recorded = await chats.find({migrated_to_chat_id: {$ne: null}, telegram_chat_id: null}).toArray();
+      for (const chat of recorded) {
+        if (chat.migration_review_reason) continue; // confirmed, waiting for an operator
+        await migrations.updateOne(
+          {_id: `${chat.id}>${chat.migrated_to_chat_id}`},
+          {$setOnInsert: {from: chat.id, to: chat.migrated_to_chat_id, source: "recorded", seen_at: now, attempts: 0,
+            confirmed_at: null, rejected_at: null}},
+          {upsert: true},
+        );
+      }
+      recordedMovesQueued = true;
+    }
+    let confirmed = 0;
+    const due = await migrations
+      .find({confirmed_at: null, rejected_at: null, retry_at: {$not: {$gt: now}}})
+      .limit(MIGRATION_BATCH)
+      .toArray();
+    for (const row of due) if (await confirmMigration(row, now)) confirmed++;
+    const recent = await migrations
+      .find({aliased: true, confirmed_at: {$gt: new Date(now.getTime() - MIGRATION_REMERGE_MS)}})
+      .limit(MIGRATION_BATCH)
+      .toArray();
+    for (const row of recent) await mergeEarlyActivity(row.from, row.to);
+    return confirmed;
+  }
+
+  // ---- Merging the new id's early activity into the economy ----
+  // Safe to run again at any step, and twice at once. Per-member documents
+  // (rewards, statistics) are added up: each one under `to` is first taken
+  // out of reach of new writes (chat_id null, merge_from/merge_into, so a
+  // late write under `to` makes a new document for a later run), then added
+  // into the member's document under `from` in one conditional update that
+  // also remembers it (merged_ids), then deleted. Everything else is re-keyed
+  // document by document, its message ids negated (messageKey); achievements
+  // the member already has under `from` are dropped.
+  const MERGE_SKIP = new Set(["_id", "chat_id", "user_id", "merge_from", "merge_into", "merged_ids", "chat"]);
+
+  // {path: n} for the numeric fields of a statistics document, nested ones
+  // (reactionsGiven.👍) included.
+  function counterIncrements(doc, prefix = "", out = {}) {
+    for (const [key, value] of Object.entries(doc)) {
+      if (!prefix && MERGE_SKIP.has(key)) continue;
+      if (typeof value === "number" && Number.isFinite(value)) out[prefix + key] = value;
+      else if (value && typeof value === "object" && !Array.isArray(value) && !(value instanceof Date)) {
+        counterIncrements(value, `${prefix}${key}.`, out);
+      }
+    }
+    return out;
+  }
+
+  // rewards: points add up; claimed_points (a number, or a decimal string)
+  // adds up exactly, staying a number while both sides are numbers.
+  function rewardIncrements(doc) {
+    return Number.isFinite(doc.points) ? {points: doc.points} : {};
+  }
+
+  async function addInto(collection, from, src, increments) {
+    const inc = increments(src);
+    const claimed = src.claimed_points ?? 0;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await collection.updateOne({chat_id: from, user_id: src.user_id}, {$setOnInsert: {chat_id: from, user_id: src.user_id}}, {upsert: true});
+      const target = await collection.findOne({chat_id: from, user_id: src.user_id});
+      if ((target.merged_ids || []).some(id => String(id) === String(src._id))) return; // added before
+      const filter = {_id: target._id, merged_ids: {$ne: src._id}};
+      const update = {$push: {merged_ids: src._id}};
+      if (collection === rewards && isPositiveDecimal(claimed)) {
+        const before = target.claimed_points ?? 0;
+        if (typeof before === "number" && typeof claimed === "number") inc.claimed_points = claimed;
+        else {
+          filter.claimed_points = target.claimed_points ?? null;
+          update.$set = {claimed_points: decimalAdd(before, claimed)};
+        }
+      }
+      if (Object.keys(inc).length) update.$inc = inc;
+      const result = await collection.updateOne(filter, update);
+      if ((result?.matchedCount ?? 0) > 0) return;
+      delete inc.claimed_points;
+    }
+    throw new Error(`${collection.collectionName ?? "collection"} ${src._id}: merging into chat ${from} kept racing`);
+  }
+
+  async function mergeMemberDocs(collection, from, to, increments) {
+    for (const doc of await collection.find({chat_id: to}).toArray()) {
+      if (doc.user_id == null) continue;
+      await collection.updateOne({_id: doc._id, chat_id: to}, {$set: {chat_id: null, merge_from: to, merge_into: from}});
+    }
+    let merged = 0;
+    for (const doc of await collection.find({merge_from: to, merge_into: from}).toArray()) {
+      await addInto(collection, from, doc, increments);
+      await collection.deleteOne({_id: doc._id});
+      merged++;
+    }
+    return merged;
+  }
+
+  // `idFields`: the message ids to negate.
+  async function rekeyDocs(collection, from, to, idFields, keep = async () => true) {
+    let moved = 0;
+    for (const doc of await collection.find({chat_id: to}).toArray()) {
+      if (!(await keep(doc))) {
+        await collection.deleteOne({_id: doc._id, chat_id: to});
+        continue;
+      }
+      const $set = {chat_id: from};
+      for (const field of idFields) if (Number.isSafeInteger(doc[field]) && doc[field] > 0) $set[field] = -doc[field];
+      try {
+        await collection.updateOne({_id: doc._id, chat_id: to}, {$set});
+        moved++;
+      } catch (error) {
+        if (error?.code !== 11000) throw error;
+        // already recorded under the economy (one update seen on both sides
+        // of the alias): that copy stays
+        console.error(`chat ${to}: ${collection.collectionName ?? "a document"} ${doc._id} is already under ${from}, dropped`);
+        await collection.deleteOne({_id: doc._id, chat_id: to});
+      }
+    }
+    return moved;
+  }
+
+  async function mergeEarlyActivity(from, to) {
+    try {
+      const moved = {
+        rewards: await mergeMemberDocs(rewards, from, to, rewardIncrements),
+        statistics: await mergeMemberDocs(statistics, from, to, doc => counterIncrements(doc)),
+        reaction_points: await rekeyDocs(reactionPoints, from, to, ["message_id"]),
+        grants: await rekeyDocs(grants, from, to, ["source_message_id"]),
+        messages: await rekeyDocs(messages, from, to, ["message_id"]),
+        achievements: await rekeyDocs(achievements, from, to, ["message_id"], async doc =>
+          !(await achievements.findOne({chat_id: from, user_id: doc.user_id, type: doc.type, collection: doc.collection ?? NFT_COLLECTION}))),
+      };
+      if (Object.values(moved).some(Boolean)) {
+        console.log(`chat ${to}: early activity merged into ${from}: ${JSON.stringify(moved)}`);
+      }
+      return moved;
+    } catch (error) {
+      // the next pass within MIGRATION_REMERGE_MS runs it again
+      console.error(`chat ${to}: merging its early activity into ${from} failed:`, error);
+      return null;
     }
   }
 
   telegraf.on(message("migrate_to_chat_id"), async (ctx, next) => {
-    await migrateChat(ctx.chat.id, ctx.message.migrate_to_chat_id).catch(error =>
-      console.error(`chat ${ctx.chat.id}: migration to ${ctx.message.migrate_to_chat_id} failed:`, error),
-    );
+    await noteMigration(ctx.chat.id, ctx.message.migrate_to_chat_id, "migrate_to_chat_id");
     return next();
   });
   telegraf.on(message("migrate_from_chat_id"), async (ctx, next) => {
-    await migrateChat(ctx.message.migrate_from_chat_id, ctx.chat.id).catch(error =>
-      console.error(`chat ${ctx.message.migrate_from_chat_id}: migration to ${ctx.chat.id} failed:`, error),
-    );
+    await noteMigration(ctx.message.migrate_from_chat_id, ctx.chat.id, "migrate_from_chat_id");
     return next();
   });
 
@@ -1058,9 +1405,10 @@ export default function createBot(database, token, options) {
       await ctx.reply(t(lang, "verifyNotCreator", t(lang, "memberStatus", member.status)));
       return;
     }
-    await handOverSubscription(ctx.chat.id, member.user.id);
-    await chats.updateOne({id: ctx.chat.id}, {$set: {creator: member.user.id}}, {upsert: true});
-    chatConfigCache.delete(ctx.chat.id);
+    const chat_id = econChatId(ctx);
+    await handOverSubscription(chat_id, member.user.id);
+    await chats.updateOne({id: chat_id}, {$set: {creator: member.user.id}}, {upsert: true});
+    chatConfigCache.delete(chat_id);
     await ctx.reply(t(lang, "verified", t(lang, "memberStatus", member.status)));
   });
 
@@ -1148,7 +1496,7 @@ export default function createBot(database, token, options) {
 
     console.log({reactionsToAdd, reactionsToRemove});
 
-    const chat_id = ctx.chat.id;
+    const chat_id = econChatId(ctx);
     const message_id = ctx.messageReaction.message_id;
 
     // keep separate reactions count for each chat
@@ -1164,7 +1512,7 @@ export default function createBot(database, token, options) {
       }
     }
 
-    const receiver = await messages.findOne({chat_id, message_id});
+    const receiver = await messages.findOne({chat_id, message_id: messageKey(ctx, message_id)});
     console.log({chat_id, message_id, receiver});
     if (!receiver) {
       // written before the bot recorded it (before it was an admin, while it
@@ -1221,15 +1569,16 @@ export default function createBot(database, token, options) {
     if (!isMemberMessage(ctx) || !CONTENT_TYPES.some(type => type in ctx.message)) return next();
 
     // upsert: a redelivered update must not record the message twice
+    const chat_id = econChatId(ctx);
     await messages.updateOne(
-      {chat_id: ctx.chat.id, message_id: ctx.message.message_id},
+      {chat_id, message_id: messageKey(ctx, ctx.message.message_id)},
       {$setOnInsert: {user_id: ctx.from.id, date: ctx.message.date}},
       {upsert: true},
     );
     // keep track of all chats
     await chats.updateOne(
-      {id: ctx.chat.id},
-      {$setOnInsert: {id: ctx.chat.id, title: ctx.chat.title}},
+      {id: chat_id},
+      {$setOnInsert: {id: chat_id, title: ctx.chat.title}},
       {upsert: true},
     );
 
@@ -1238,7 +1587,7 @@ export default function createBot(database, token, options) {
 
   telegraf.on(message("video_note"), async (ctx, next) => {
     if (!isMemberMessage(ctx)) return next();
-    await incrementStat(statistics, ctx.chat.id, ctx.from.id, "video_note");
+    await incrementStat(statistics, econChatId(ctx), ctx.from.id, "video_note");
     giveAchievement(ctx, achievements, "telescope");
 
     return next();
@@ -1246,7 +1595,7 @@ export default function createBot(database, token, options) {
 
   telegraf.on(message("voice"), async (ctx, next) => {
     if (!isMemberMessage(ctx)) return next();
-    await incrementStat(statistics, ctx.chat.id, ctx.from.id, "voice");
+    await incrementStat(statistics, econChatId(ctx), ctx.from.id, "voice");
     giveAchievement(ctx, achievements, "voicy");
 
     return next();
@@ -1254,7 +1603,7 @@ export default function createBot(database, token, options) {
 
   telegraf.on(message("sticker"), async (ctx, next) => {
     if (!isMemberMessage(ctx)) return next();
-    await incrementStat(statistics, ctx.chat.id, ctx.from.id, "sticker");
+    await incrementStat(statistics, econChatId(ctx), ctx.from.id, "sticker");
     giveAchievement(ctx, achievements, "sticker");
 
     return next();
@@ -1265,7 +1614,7 @@ export default function createBot(database, token, options) {
 
     // keep separate messages count for each chat; read back atomically so
     // concurrent messages cannot both (or neither) see the threshold
-    const chatUser = await incrementStat(statistics, ctx.chat.id, ctx.from.id, "messages");
+    const chatUser = await incrementStat(statistics, econChatId(ctx), ctx.from.id, "messages");
 
     if (chatUser?.messages === 100) {
       giveAchievement(ctx, achievements, "talkative");
@@ -1370,15 +1719,18 @@ export default function createBot(database, token, options) {
   telegraf.on("pre_checkout_query", async ctx => {
     const query = ctx.preCheckoutQuery;
     const lang = await ctx.state.lang();
-    const chat_id = parseSubscriptionPayload(query.invoice_payload);
-    if (chat_id === null || query.currency !== "XTR") {
+    const paidFor = parseSubscriptionPayload(query.invoice_payload);
+    if (paidFor === null || query.currency !== "XTR") {
       await ctx.answerPreCheckoutQuery(false, t(lang, "subscriptionPayFailed"));
       return;
     }
+    // an invoice made out to a supergroup's own id pays for its economy
+    const chat_id = await economyChatId({id: paidFor, type: "supergroup"});
     const chat = await chats.findOne({id: chat_id});
-    // the stored creator can be stale (ownership transfer): ask Telegram
+    // the stored creator can be stale (ownership transfer): ask Telegram,
+    // in the chat's supergroup if it has become one
     const member = chat?.creator === query.from.id
-      ? await ctx.telegram.getChatMember(chat_id, query.from.id).catch(() => null)
+      ? await ctx.telegram.getChatMember(await telegramChatId(chat_id), query.from.id).catch(() => null)
       : null;
     if (!chat?.jetton_master || member?.status !== "creator") {
       console.log(`chat ${chat_id}: subscription payment by ${query.from.id} refused, not the creator`);
@@ -1390,8 +1742,9 @@ export default function createBot(database, token, options) {
 
   telegraf.on(message("successful_payment"), async ctx => {
     const payment = ctx.message.successful_payment;
-    const chat_id = parseSubscriptionPayload(payment.invoice_payload);
-    if (chat_id === null) return;
+    const paidFor = parseSubscriptionPayload(payment.invoice_payload);
+    if (paidFor === null) return;
+    const chat_id = await economyChatId({id: paidFor, type: "supergroup"});
     const now = new Date();
     const expires = payment.subscription_expiration_date
       ? new Date(payment.subscription_expiration_date * 1000)
@@ -1446,8 +1799,8 @@ export default function createBot(database, token, options) {
       .catch(console.error);
     if (chat?.sub_stop_announced_for) {
       await chats.updateOne({id: chat_id}, {$unset: {sub_stop_announced_for: ""}});
-      await telegraf.telegram
-        .sendMessage(chat_id, t(await chatLang(chat_id), "subscriptionResumed"))
+      await postToChat(await telegramChatId(chat_id), {text: t(await chatLang(chat_id), "subscriptionResumed"), extra: {}},
+        `chat ${chat_id} resumed announcement`)
         .catch(error => console.error(`chat ${chat_id}: resumed announcement failed:`, error?.message || error));
     }
   });
@@ -1459,7 +1812,8 @@ export default function createBot(database, token, options) {
   async function runSubscriptions(now) {
     if (!subscriptionConfig().enabled) return 0;
     let notices = 0;
-    const withJetton = await chats.find({jetton_master: {$ne: null}}).toArray();
+    // a supergroup's own document is not an economy (economy_chat_id)
+    const withJetton = await chats.find({jetton_master: {$ne: null}, economy_chat_id: null}).toArray();
     for (const chat of withJetton) {
       try {
         if (!chat.trial_started_at && !chat.paid_until) {
@@ -1490,8 +1844,8 @@ export default function createBot(database, token, options) {
             await chats.findOneAndUpdate({id: chat.id, sub_stop_announced_for: {$ne: period}}, {$set: {sub_stop_announced_for: period}}),
           );
           if (!claimed) continue;
-          await telegraf.telegram
-            .sendMessage(chat.id, t(lang, "subscriptionStopped"))
+          await postToChat(await telegramChatId(chat.id), {text: t(lang, "subscriptionStopped"), extra: {}},
+            `chat ${chat.id} stop announcement`)
             .catch(error => console.error(`chat ${chat.id}: stop announcement failed:`, error?.message || error));
           if (chat.creator) await notifyUser(chat.creator, "subscriptionEndedCreator", {title: chat.title}, lang);
           console.log(`chat ${chat.id}: points paused, subscription ${service.state}`);
@@ -1531,8 +1885,9 @@ export default function createBot(database, token, options) {
   // except when no retry can help: the bot was removed or restricted, or the
   // chat is gone (the chat gets bot_cannot_post_at), or Telegram refuses the
   // request itself. A 429 pauses sending (createPause) without counting as
-  // an attempt, and a group that became a supergroup is followed to its new
-  // id (migrateChat) and sent to there; the row keeps its chat_id and gets
+  // an attempt. A group that became a supergroup is posted to under its
+  // telegram id (telegramChatId), or followed there on the 400 that says so
+  // (noteMigration); the row keeps its chat_id, the economy id, and gets
   // `posted_chat_id`. A row given up this way still has
   // its members' private messages queued: they are what protects a member
   // before a price decrease, and the chat not hearing it is all the more
@@ -1623,8 +1978,10 @@ export default function createBot(database, token, options) {
     };
   }
 
-  // Sends `message` to the chat, following it to its supergroup if it has
-  // become one; resolves to {chat_id, message_id} of where it went.
+  // Sends `message` to `chat_id` (a telegram id: telegramChatId), following
+  // the chat to its supergroup if it has become one meanwhile; resolves to
+  // {chat_id, message_id} of where it went. An error from the supergroup
+  // carries its id as `chatId`.
   async function postToChat(chat_id, message, where, now = new Date()) {
     try {
       const posted = await telegraf.telegram.sendMessage(chat_id, message.text, message.extra);
@@ -1633,9 +1990,16 @@ export default function createBot(database, token, options) {
       const outcome = classifyTelegramError(error, CHAT_UNREACHABLE);
       if (outcome.kind !== "migrated") throw error;
       console.log(`${where}: the group is now supergroup ${outcome.chatId}, following it`);
-      await migrateChat(chat_id, outcome.chatId, now);
-      const posted = await telegraf.telegram.sendMessage(outcome.chatId, message.text, message.extra);
-      return {chat_id: outcome.chatId, message_id: posted?.message_id ?? null};
+      // Telegram's own answer, so the post follows it now; the economy's
+      // alias waits for getChat to confirm it
+      await noteMigration(chat_id, outcome.chatId, "send", now);
+      try {
+        const posted = await telegraf.telegram.sendMessage(outcome.chatId, message.text, message.extra);
+        return {chat_id: outcome.chatId, message_id: posted?.message_id ?? null};
+      } catch (followError) {
+        if (followError && typeof followError === "object") followError.chatId = outcome.chatId;
+        throw followError;
+      }
     }
   }
 
@@ -1696,7 +2060,7 @@ export default function createBot(database, token, options) {
 
         const fansOut = hasPrivateMessages(row);
         // a group that became a supergroup is posted to under its new id
-        const target = (await getChatConfig(row.chat_id)).migrated_to_chat_id ?? row.chat_id;
+        const target = await telegramChatId(row.chat_id);
         let posted;
         try {
           posted = await postToChat(target, message, where, now);
@@ -1713,7 +2077,7 @@ export default function createBot(database, token, options) {
             break;
           }
           // the chat that refused it: postToChat may have followed a migration
-          const failedIn = (await getChatConfig(target)).migrated_to_chat_id ?? target;
+          const failedIn = error?.chatId ?? target;
           held.add(row.chat_id);
           const permanent = outcome.kind === "unreachable" || outcome.kind === "rejected";
           const attempts = permanent ? ANNOUNCE_MAX_ATTEMPTS : (row.attempts || 0) + 1;
@@ -2313,7 +2677,7 @@ export default function createBot(database, token, options) {
     const ref = decrease.requested.getTime();
     if (platformSweep.of !== `${type}:${ref}`) Object.assign(platformSweep, {of: `${type}:${ref}`, after: null});
 
-    const filter = {point_price: null, jetton_master: {$ne: null}};
+    const filter = {point_price: null, jetton_master: {$ne: null}, economy_chat_id: null};
     if (platformSweep.after !== null) filter._id = {$gt: platformSweep.after};
     const batch = await chats.find(filter).sort({_id: 1}).limit(ANNOUNCE_BATCH).toArray();
     platformSweep.after = batch.length < ANNOUNCE_BATCH ? null : batch.at(-1)._id;
@@ -2343,8 +2707,14 @@ export default function createBot(database, token, options) {
   // what they queued. Never rejects; resolves to what it did, for logs and
   // tests.
   async function runAnnouncements(now = new Date()) {
-    const done = {sent: 0, applied: 0, subscriptions: 0, reach: 0};
+    const done = {sent: 0, applied: 0, subscriptions: 0, reach: 0, migrations: 0};
     const held = new Set();
+    // first: confirmed moves decide where this pass posts
+    try {
+      done.migrations = await runMigrations(now);
+    } catch (error) {
+      console.error("confirming chat migrations failed:", error);
+    }
     try {
       await queueMissedScheduled(now);
     } catch (error) {

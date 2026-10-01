@@ -27,6 +27,16 @@ which pushed every commit on `main` without running the tests.
      `https://` is accepted too). On start the bot calls `setWebhook` with
      it.
    - `PORT=3000`. It must match Ports Exposes.
+   - `WEBHOOK_SECRET` (optional): the webhook's secret token. Telegram sends
+     it in the `X-Telegram-Bot-Api-Secret-Token` header of every update, and
+     the bot answers 403 to any request without it, so a forged update cannot
+     reach it even if the webhook URL leaks (a forged "upgraded to a
+     supergroup" message could otherwise attach one chat to another chat's
+     TON pool). 1-256 characters of `A-Z a-z 0-9 _ -`; the bot refuses to
+     start with anything else. Unset, it is derived from `ACHIVATOR_TOKEN`
+     (a SHA-256), so it needs no setup and survives redeploys. Set it to
+     rotate it independently of the token; the next start registers it with
+     `setWebhook`.
    - `ACHIVATOR_TOKEN`, `MONGODB_URI`: the same database as the mini app
      (`achivator_bot`).
    - `MONGODB_URI`, `ACHIVATOR_TOKEN` and `WEBHOOK_URL` are **required in
@@ -71,4 +81,7 @@ itself. So:
    Otherwise, the next time it restarts it takes the webhook back, and the
    two deployments steal updates from each other.
 4. Check with `https://api.telegram.org/bot<token>/getWebhookInfo` that
-   `url` is the Coolify domain and `last_error_message` is empty.
+   `url` is the Coolify domain and `last_error_message` is empty. A
+   `last_error_message` of "Wrong response from the webhook: 403 Forbidden"
+   means two deployments with different `WEBHOOK_SECRET`s are fighting over
+   the webhook: the one that started last registered its secret.

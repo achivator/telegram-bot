@@ -1,7 +1,7 @@
 // Smoke test: drives real Telegram updates through createBot with an
 // in-memory stand-in for the handful of MongoDB operations the bot uses.
 import assert from "node:assert/strict";
-import {Telegram} from "telegraf";
+import {Telegram, TelegramError} from "telegraf";
 
 const sent = [];
 const commandMenus = [];
@@ -13,8 +13,21 @@ const failingChats = new Set();
 const sendAttempts = [];
 // private messages to these users fail with the error the function returns
 const dmFailures = new Map();
+// group id -> supergroup id: getChat on the group answers as Telegram does
+// for an upgraded group, 400 with migrate_to_chat_id
+const upgradedGroups = new Map();
+// the chat ids getChatMember was asked about
+const memberLookups = [];
 Telegram.prototype.callApi = async function (method, payload) {
+  if (method === "getChat") {
+    if (upgradedGroups.has(payload.chat_id)) {
+      throw new TelegramError({ok: false, error_code: 400, description: "Bad Request: group chat was upgraded to a supergroup chat",
+        parameters: {migrate_to_chat_id: upgradedGroups.get(payload.chat_id)}});
+    }
+    return {id: payload.chat_id, type: "supergroup"};
+  }
   if (method === "getChatMember") {
+    memberLookups.push(payload.chat_id);
     const status = statuses.get(payload.user_id) ?? "member";
     if (status === "error") throw new Error("Bad Request: user not found");
     return {status, user: {id: payload.user_id, first_name: `U${payload.user_id}`}};
@@ -36,18 +49,20 @@ const set = (doc, path, v) => { const ks = path.split("."); let o = doc; for (co
 // Mongo semantics the bot relies on: null matches a missing field, dates
 // compare by value, comparisons never match a missing field.
 const same = (a, b) => (a instanceof Date && b instanceof Date ? a.getTime() === b.getTime() : a === b);
+// an array field matches a value it contains, as in MongoDB
+const has = (x, v) => (Array.isArray(x) ? x.some(e => same(e, v)) : same(x, v));
 const OPS = {
   $lt: (x, v) => x != null && x < v,
   $gt: (x, v) => x != null && x > v,
   $in: (x, v) => v.some(y => same(x, y)),
   $lte: (x, v) => x != null && x <= v,
   $gte: (x, v) => x != null && x >= v,
-  $ne: (x, v) => !same(x ?? null, v),
+  $ne: (x, v) => !has(x ?? null, v),
   $not: (x, v) => !test(x, v),
 };
 const isOps = v => v && typeof v === "object" && !(v instanceof Date) && Object.keys(v).every(k => k in OPS);
 const test = (x, v) =>
-  isOps(v) ? Object.entries(v).every(([op, arg]) => OPS[op](x, arg)) : v === null ? x == null : same(x, v);
+  isOps(v) ? Object.entries(v).every(([op, arg]) => OPS[op](x, arg)) : v === null ? x == null : has(x, v);
 const matches = (doc, filter) =>
   Object.entries(filter).every(([k, v]) => (k === "$or" ? v.some(f => matches(doc, f)) : test(get(doc, k), v)));
 const dup = () => Object.assign(new Error("E11000"), {code: 11000});
@@ -100,7 +115,12 @@ class Coll {
     await this.insertOne(doc);
     return doc;
   }
-  async updateOne(f, u, opts) { await this.upsertOrUpdate(f, u, opts); return {}; }
+  async updateOne(f, u, opts) {
+    const hit = this.docs.some(d => matches(d, f));
+    const doc = await this.upsertOrUpdate(f, u, opts);
+    return {matchedCount: hit ? 1 : 0, modifiedCount: hit ? 1 : 0, upsertedCount: !hit && doc ? 1 : 0};
+  }
+  async deleteOne(f) { const i = this.docs.findIndex(d => matches(d, f)); if (i >= 0) this.docs.splice(i, 1); return {deletedCount: i < 0 ? 0 : 1}; }
   async updateMany(f, u) { const hit = this.docs.filter(d => matches(d, f)); for (const d of hit) this.apply(d, u, false); return {modifiedCount: hit.length}; }
   async findOneAndUpdate(f, u, opts) { return {value: structuredClone(await this.upsertOrUpdate(f, u, opts))}; }
   async findOneAndDelete(f) { const i = this.docs.findIndex(d => matches(d, f)); return {value: i < 0 ? null : this.docs.splice(i, 1)[0]}; }
@@ -761,7 +781,6 @@ console.error = originalError;
 
 // ---- Private reminders about a price decrease ----
 console.error = (...args) => errors.push(args.map(String).join(" "));
-const {TelegramError} = await import("telegraf");
 const {decimalMul, decimalSub} = await import("../decimal.mjs");
 const tgError = (error_code, description, parameters) => () => new TelegramError({ok: false, error_code, description, parameters});
 const rewardsColl = database.collection("rewards");
@@ -1354,15 +1373,17 @@ assert.equal(dmsTo(6101).at(-1).text, "In Muted, the planned price drop is cance
 dmFailures.delete(MUTED.id);
 
 // A group that became a supergroup: the send to the old id fails with
-// migrate_to_chat_id, the move is recorded and the announcement goes to the
-// new id. Everything economic stays under the old id (its TON pool is
-// derived from it), and the new chat's own document is not overwritten.
+// migrate_to_chat_id, getChat confirms it, the announcement goes to the new
+// id and the supergroup becomes an alias of the old economy: everything
+// economic stays under the old id (its TON pool is derived from it), and the
+// new chat's own document keeps what it had.
 const OLD = -952, NEW = -100952;
 const JETTON = "EQ" + "c".repeat(46);
 await chatsColl.insertOne({id: OLD, title: "Old", lang: "ru", jetton_master: JETTON, creator: CREATOR, point_price: "1"});
 await chatsColl.insertOne({id: NEW, title: "New", lang: "en"});
 await giveReward(OLD, 6201, 3);
 const rewardsIn = chat_id => rewardsColl.docs.filter(d => d.chat_id === chat_id).map(d => [d.user_id, d.points]);
+upgradedGroups.set(OLD, NEW);
 dmFailures.set(OLD, tgError(400, "Bad Request: group chat was upgraded to a supergroup chat", {migrate_to_chat_id: NEW}));
 const {insertedId: movedRow} = await queue(OLD, "price_increased", {from: "1", to: "2", symbol: "X", cancelled_pending: false},
   {created_at: minutes(55)});
@@ -1374,19 +1395,22 @@ const withoutId = doc => Object.fromEntries(Object.entries(doc).filter(([k]) => 
 const migratedChats = () => ({oldDoc: withoutId(chatDoc(OLD)), newDoc: withoutId(chatDoc(NEW))});
 assert.deepEqual(migratedChats(), {
   oldDoc: {id: OLD, title: "Old", lang: "ru", jetton_master: JETTON, creator: CREATOR, point_price: "1",
-    migrated_to_chat_id: NEW, migrated_at: minutes(56), migration_needs_review: true},
-  newDoc: {id: NEW, title: "New", lang: "en", migrated_from_chat_id: OLD},
+    migrated_to_chat_id: NEW, migrated_at: minutes(56), telegram_chat_id: NEW, migrated_automatically_at: minutes(56)},
+  newDoc: {id: NEW, title: "New", lang: "en", migrated_from_chat_id: OLD, economy_chat_id: OLD},
 });
+const migrationRow = (from, to) => cols.get("chat_migrations").docs.find(d => d._id === `${from}>${to}`);
+assert.deepEqual([migrationRow(OLD, NEW).source, migrationRow(OLD, NEW).aliased, migrationRow(OLD, NEW).confirmed_at.getTime()],
+  ["send", true, minutes(56).getTime()]);
 assert.deepEqual([rewardsIn(OLD), rewardsIn(NEW)], [[[6201, 3]], []], "points stay with the pool's chat id");
-const migrationLog = `chat ${OLD} migrated to ${NEW}; economic data and the TON pool stay keyed by ${OLD}`;
-assert.equal(errors.filter(line => line.includes(migrationLog)).length, 1);
+const migrationLog = `chat ${OLD} migrated to ${NEW}: the supergroup now earns into ${OLD}`;
+assert.equal(logs.filter(line => line.startsWith(migrationLog)).length, 1);
 // the supergroup's service message records it again: nothing changes
 const snapshot = JSON.stringify(migratedChats());
 await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
   chat: {id: NEW, type: "supergroup", title: "New"}, from: user(CREATOR), migrate_from_chat_id: OLD}});
 assert.equal(JSON.stringify(migratedChats()), snapshot);
 assert.equal(chatsColl.docs.filter(d => d.id === NEW).length, 1);
-assert.equal(errors.filter(line => line.includes(migrationLog)).length, 1, "logged once");
+assert.equal(logs.filter(line => line.startsWith(migrationLog)).length, 1, "logged once");
 // later announcements for the old id go straight to the new one
 await queue(OLD, "price_decrease_cancelled", {from: "2", to: "1", symbol: "X"}, {created_at: minutes(56)});
 await run(minutes(56.5));
@@ -1401,11 +1425,13 @@ const OLD2 = -953, NEW2 = -100953;
 await chatsColl.insertOne({id: OLD2, title: "Old2", jetton_master: JETTON, point_price: "1",
   point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
 await giveReward(OLD2, 6301, 2);
+upgradedGroups.set(OLD2, NEW2);
 await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
   chat: {id: OLD2, type: "group", title: "Old2"}, from: user(CREATOR), migrate_to_chat_id: NEW2}});
-assert.deepEqual(withoutId(chatDoc(NEW2)), {id: NEW2, migrated_from_chat_id: OLD2});
+assert.deepEqual(withoutId(chatDoc(NEW2)), {id: NEW2, migrated_from_chat_id: OLD2, economy_chat_id: OLD2});
 assert.equal(chatDoc(OLD2).point_price_pending.price, "0.5");
-assert.equal(chatDoc(OLD2).migration_needs_review, true);
+assert.equal(chatDoc(OLD2).telegram_chat_id, NEW2);
+assert.ok(!("migration_needs_review" in chatDoc(OLD2)));
 const {insertedId: oldScheduled} = await queue(OLD2, "price_decrease_scheduled",
   {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT}, {created_at: minutes(57)});
 await run(minutes(57));
@@ -1415,6 +1441,228 @@ assert.deepEqual([row(oldScheduled).chat_id, row(oldScheduled).posted_chat_id], 
 assert.deepEqual(holdersOf(oldScheduled), [6301]);
 await runDms(minutes(57));
 assert.match(dmsTo(6301).at(-1).text, /^In Old2, the price of a point drops on 8 Oct 2026/);
+
+// ---- No alias without Telegram's word ----
+// A service message getChat does not confirm (a forged update, or Telegram
+// not answering yet) records nothing: the supergroup keeps its own id, the
+// group's economy is untouched, and the claim is asked about again with
+// backoff, then rejected. getChat naming another supergroup rejects it at once.
+const VICTIM = -2955, INTRUDER = -1002955;
+await chatsColl.insertOne({id: VICTIM, title: "Victim", jetton_master: JETTON, creator: CREATOR});
+await giveReward(VICTIM, 6501, 7);
+const INTRUDER_CHAT = {id: INTRUDER, type: "supergroup", title: "Intruder"};
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
+  chat: INTRUDER_CHAT, from: user(6502), migrate_from_chat_id: VICTIM}});
+const victimSnapshot = JSON.stringify(withoutId(chatDoc(VICTIM)));
+assert.deepEqual(Object.keys(withoutId(chatDoc(VICTIM))), ["id", "title", "jetton_master", "creator"]);
+assert.equal(chatDoc(INTRUDER), undefined, "nothing recorded for the intruder");
+assert.deepEqual([migrationRow(VICTIM, INTRUDER).attempts, migrationRow(VICTIM, INTRUDER).confirmed_at, migrationRow(VICTIM, INTRUDER).rejected_at],
+  [1, null, null]);
+assert.match(errors.at(-1), /chat -2955 -> -1002955 \(migrate_from_chat_id\): not confirmed by Telegram .*asking again later/);
+// the intruder's members earn nothing from the victim's pool
+for (let i = 0; i < 5; i++) await inChat(INTRUDER_CHAT, user(6503), {text: `farm ${i}`});
+const intruderPost = ++msgId;
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: intruderPost, date: 1, chat: INTRUDER_CHAT, from: user(6502), text: "pay me"}});
+await bot.handleUpdate({update_id: ++updateId, message_reaction: {chat: INTRUDER_CHAT, message_id: intruderPost, user: user(6503), date: 1,
+  old_reaction: [], new_reaction: [{type: "emoji", emoji: "👍"}]}});
+assert.deepEqual(rewardsIn(VICTIM), [[6501, 7]]);
+assert.equal(cols.get("messages").docs.filter(d => d.chat_id === VICTIM).length, 0);
+// retried by the pass only once retry_at is due, then given up
+const retryAt = migrationRow(VICTIM, INTRUDER).retry_at;
+assert.equal(retryAt.getTime(), migrationRow(VICTIM, INTRUDER).seen_at.getTime() + 60 * 1000);
+await bot.announcements.run(new Date(retryAt.getTime() - 1));
+assert.equal(migrationRow(VICTIM, INTRUDER).attempts, 1);
+for (let i = 0; i < 10 && !migrationRow(VICTIM, INTRUDER).rejected_at; i++) {
+  await bot.announcements.run(migrationRow(VICTIM, INTRUDER).retry_at);
+}
+assert.equal(migrationRow(VICTIM, INTRUDER).attempts, 8);
+assert.ok(migrationRow(VICTIM, INTRUDER).rejected_at);
+assert.equal(JSON.stringify(withoutId(chatDoc(VICTIM))), victimSnapshot);
+// the victim group really was upgraded, but to another supergroup
+const REAL = -1002956;
+upgradedGroups.set(VICTIM, REAL);
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
+  chat: INTRUDER_CHAT, from: user(6502), migrate_from_chat_id: VICTIM}});
+assert.equal(migrationRow(VICTIM, INTRUDER).attempts, 9);
+assert.match(migrationRow(VICTIM, INTRUDER).last_error, /upgraded to -1002956/);
+assert.equal(JSON.stringify(withoutId(chatDoc(VICTIM))), victimSnapshot);
+assert.deepEqual(withoutId(chatDoc(INTRUDER)), {id: INTRUDER, title: "Intruder"}, "a chat of its own, no alias");
+upgradedGroups.delete(VICTIM);
+
+// A supergroup with money of its own (here: claims from a pool of its own)
+// is not merged: its posts follow the chat, an operator reviews the rest.
+const SPLIT = -2957, SPLIT_SUPER = -1002957;
+await chatsColl.insertOne({id: SPLIT, title: "Split", jetton_master: JETTON});
+await chatsColl.insertOne({id: SPLIT_SUPER, title: "Split", jetton_master: JETTON});
+await giveReward(SPLIT_SUPER, 6601, 4);
+await database.collection("claims").insertOne({chat_id: SPLIT_SUPER, user_id: 6601, points: 4, status: "claimed"});
+upgradedGroups.set(SPLIT, SPLIT_SUPER);
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
+  chat: {id: SPLIT_SUPER, type: "supergroup", title: "Split"}, from: user(CREATOR), migrate_from_chat_id: SPLIT}});
+assert.deepEqual(
+  [chatDoc(SPLIT).migrated_to_chat_id, chatDoc(SPLIT).telegram_chat_id, chatDoc(SPLIT).migration_needs_review, chatDoc(SPLIT).migration_review_reason],
+  [SPLIT_SUPER, undefined, true, `members of chat ${SPLIT_SUPER} already claimed from a pool of its own`]);
+assert.equal(chatDoc(SPLIT_SUPER).economy_chat_id, undefined);
+assert.deepEqual([migrationRow(SPLIT, SPLIT_SUPER).aliased, migrationRow(SPLIT, SPLIT_SUPER).conflict],
+  [false, `members of chat ${SPLIT_SUPER} already claimed from a pool of its own`]);
+assert.deepEqual(rewardsIn(SPLIT_SUPER), [[6601, 4]], "not merged");
+assert.equal(errors.filter(line => line.includes(`chat ${SPLIT} migrated to ${SPLIT_SUPER}, not merged`)).length, 1);
+upgradedGroups.delete(SPLIT);
+
+// ---- A migrated chat, end to end ----
+// Group ECON has a jetton, a pool (keyed by ECON), members and points. It is
+// upgraded to SUPER; the supergroup is used for a while before the bot hears
+// of it (here: the creator re-ran /jetton with the same jetton there, members
+// wrote and reacted, a stale process granted points), then the alias
+// activates and all of it lands in ECON's economy.
+const ECON = -2960, SUPER = -1002960;
+const ECON_CHAT = {id: ECON, type: "group", title: "Econ"};
+const SUPER_CHAT = {id: SUPER, type: "supergroup", title: "Econ"};
+const E_ADMIN = 6701, E_AUTHOR = 6702, E_FAN = 6703, E_LATE = 6704, E_OLDIE = 6705;
+await chatsColl.insertOne({id: ECON, title: "Econ", jetton_master: JETTON, creator: CREATOR, lang: "en"});
+const econ = (name, filter = {}) => cols.get(name).docs.filter(d => d.chat_id === ECON && matchesAll(d, filter));
+const underSuper = name => cols.get(name).docs.filter(d => d.chat_id === SUPER);
+const matchesAll = (d, filter) => Object.entries(filter).every(([k, v]) => d[k] === v);
+const econPoints = id => econ("rewards", {user_id: id}).reduce((sum, d) => sum + d.points, 0);
+// in the old group: a fan with 5 messages, and message 9001 by E_OLDIE
+for (let i = 0; i < 5; i++) {
+  await bot.handleUpdate({update_id: ++updateId, message: {message_id: 8001 + i, date: 1, chat: ECON_CHAT, from: user(E_FAN), text: `old ${i}`}});
+}
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: 9001, date: 1, chat: ECON_CHAT, from: user(E_OLDIE), text: "old post"}});
+await bot.handleUpdate({update_id: ++updateId, message_reaction: {chat: ECON_CHAT, message_id: 9001, user: user(E_FAN), date: 1,
+  old_reaction: [], new_reaction: [{type: "emoji", emoji: "👍"}]}});
+assert.equal(econPoints(E_OLDIE), 1);
+// the member had claimed part of it as a decimal (the bot's own arithmetic)
+await rewardsColl.updateOne({chat_id: ECON, user_id: E_AUTHOR}, {$set: {points: 10, claimed_points: "2.5"}}, {upsert: true});
+await database.collection("achievements").insertOne({chat_id: ECON, user_id: E_AUTHOR, type: "sticker", collection: "v1", date: 1, message_id: 8000});
+
+// Before the alias: the supergroup is a chat of its own to the bot.
+statuses.set(CREATOR, "creator");
+await inChat(SUPER_CHAT, speaker(CREATOR, "en"), command(`/jetton ${JETTON}`));
+for (let i = 0; i < 5; i++) {
+  await bot.handleUpdate({update_id: ++updateId, message: {message_id: 9001 + i, date: 1, chat: SUPER_CHAT, from: user(E_FAN), text: `new ${i}`}});
+}
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: 9010, date: 1, chat: SUPER_CHAT, from: user(E_AUTHOR), sticker: {file_id: "s"}}});
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: 9011, date: 1, chat: SUPER_CHAT, from: user(E_AUTHOR), voice: {file_id: "v"}}});
+await bot.handleUpdate({update_id: ++updateId, message_reaction: {chat: SUPER_CHAT, message_id: 9010, user: user(E_FAN), date: 1,
+  old_reaction: [], new_reaction: [{type: "emoji", emoji: "🔥"}]}});
+await rewardsColl.updateOne({chat_id: SUPER, user_id: E_AUTHOR}, {$inc: {points: 2}, $set: {claimed_points: "0.25"}});
+await database.collection("grants").insertOne({chat_id: SUPER, user_id: E_LATE, points: 5, source: "admin-command",
+  granted_by: E_ADMIN, source_message_id: 9020, date: Date.now()});
+await rewardsColl.insertOne({chat_id: SUPER, user_id: E_LATE, points: 5});
+assert.deepEqual([underSuper("rewards").length, underSuper("reaction_points").length, underSuper("messages").length,
+  underSuper("achievements").length, underSuper("grants").length, underSuper("statistics").length], [2, 1, 7, 2, 1, 2]);
+assert.equal(econPoints(E_AUTHOR), 10);
+// a merge that died halfway on another process: taken out of reach and
+// already added to the member's points, not yet deleted
+await rewardsColl.insertOne({_id: "half-merged", chat_id: null, merge_from: SUPER, merge_into: ECON, user_id: E_OLDIE, points: 100});
+await rewardsColl.updateOne({chat_id: ECON, user_id: E_OLDIE}, {$inc: {points: 100}, $push: {merged_ids: "half-merged"}});
+assert.equal(econPoints(E_OLDIE), 101);
+
+// The alias activates: getChat confirms, the early activity is merged.
+upgradedGroups.set(ECON, SUPER);
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: 9100, date: 1, chat: SUPER_CHAT, from: user(CREATOR), migrate_from_chat_id: ECON}});
+assert.deepEqual([chatDoc(SUPER).economy_chat_id, chatDoc(ECON).telegram_chat_id, migrationRow(ECON, SUPER).aliased], [ECON, SUPER, true]);
+for (const name of ["rewards", "reaction_points", "messages", "achievements", "grants", "statistics"]) {
+  assert.deepEqual(underSuper(name), [], `nothing left under the supergroup's id in ${name}`);
+}
+assert.equal(cols.get("rewards").docs.filter(d => d.merge_from === SUPER).length, 0);
+// points add up, claimed_points exactly (2.5 + 0.25), the half-done merge is not added twice
+assert.deepEqual([econPoints(E_AUTHOR), econ("rewards", {user_id: E_AUTHOR})[0].claimed_points], [10 + 1 + 2, "2.75"]);
+assert.equal(econ("rewards", {user_id: E_AUTHOR}).length, 1);
+assert.equal(econPoints(E_LATE), 5);
+assert.equal(econPoints(E_OLDIE), 101);
+// re-keyed, the supergroup's message ids negated: message 9001 of the group
+// and 9001 of the supergroup stay two messages by their own authors
+assert.deepEqual(econ("messages").filter(d => Math.abs(d.message_id) === 9001).map(d => [d.message_id, d.user_id]).sort(),
+  [[-9001, E_FAN], [9001, E_OLDIE]]);
+assert.deepEqual(econ("reaction_points").filter(d => d.message_id < 0).map(d => [d.message_id, d.receiver_id, d.points]), [[-9010, E_AUTHOR, 1]]);
+assert.deepEqual(econ("grants").map(d => [d.user_id, d.source_message_id]), [[E_LATE, -9020]]);
+// "sticker" was already E_AUTHOR's here: dropped; "voicy" moved
+assert.deepEqual(econ("achievements", {user_id: E_AUTHOR}).map(d => [d.type, d.message_id]).sort(), [["sticker", 8000], ["voicy", -9011]]);
+// statistics add up
+const fanStats = econ("statistics", {user_id: E_FAN});
+assert.deepEqual([fanStats.length, fanStats[0].messages, fanStats[0].reactionsGiven["👍"], fanStats[0].reactionsGiven["🔥"], fanStats[0].reactions],
+  [1, 10, 1, 1, 2]);
+const merged = JSON.stringify(cols.get("rewards").docs);
+// a second run (the pass re-merges for ten minutes) changes nothing...
+await bot.announcements.run(new Date(Date.now() + 1000));
+assert.equal(JSON.stringify(cols.get("rewards").docs), merged);
+// ...but takes in what a process with a stale cache still wrote under the
+// supergroup's id
+await rewardsColl.insertOne({chat_id: SUPER, user_id: E_LATE, points: 1, claimed_points: 1});
+await bot.announcements.run(new Date(Date.now() + 2000));
+assert.deepEqual([econPoints(E_LATE), econ("rewards", {user_id: E_LATE})[0].claimed_points, underSuper("rewards").length], [6, 1, 0]);
+await bot.announcements.run(new Date(Date.now() + 3000));
+assert.equal(econPoints(E_LATE), 6, "merged once");
+
+// After the alias: activity in the supergroup accrues to the old id.
+const superMessage = async (from, message_id, content) =>
+  bot.handleUpdate({update_id: ++updateId, message: {message_id, date: 1, chat: SUPER_CHAT, from, ...content}});
+await superMessage(user(E_AUTHOR), 9200, {text: "after the upgrade"});
+await bot.handleUpdate({update_id: ++updateId, message_reaction: {chat: SUPER_CHAT, message_id: 9200, user: user(E_FAN), date: 1,
+  old_reaction: [], new_reaction: [{type: "emoji", emoji: "❤"}]}});
+assert.equal(econPoints(E_AUTHOR), 14, "a reaction in the supergroup pays into the old economy");
+assert.deepEqual(econ("reaction_points").filter(d => d.message_id === -9200).map(d => d.receiver_id), [E_AUTHOR]);
+await bot.handleUpdate({update_id: ++updateId, message_reaction: {chat: SUPER_CHAT, message_id: 9200, user: user(E_FAN), date: 1,
+  old_reaction: [{type: "emoji", emoji: "❤"}], new_reaction: []}});
+assert.equal(econPoints(E_AUTHOR), 13, "and a removal takes it back there");
+assert.deepEqual(underSuper("rewards"), []);
+// an achievement: recorded under the old id, announced in the supergroup
+await superMessage(user(E_FAN), 9201, {video_note: {file_id: "vn"}});
+await settle();
+assert.deepEqual(econ("achievements", {user_id: E_FAN}).map(d => [d.type, d.message_id]), [["telescope", -9201]]);
+assert.match(lastText(SUPER), /New achievement unlocked: telescope/);
+// commands act on the economy; admin rights are asked of the supergroup
+statuses.set(E_ADMIN, "administrator");
+memberLookups.length = 0;
+await superMessage(speaker(E_ADMIN, "en"), 9202, command(`/reward ${E_LATE} 3 helped`));
+assert.deepEqual(memberLookups, [SUPER]);
+assert.match(lastText(SUPER), /3 points/);
+assert.deepEqual(econ("grants").filter(d => d.points === 3).map(d => [d.user_id, d.source_message_id]), [[E_LATE, -9202]]);
+assert.equal(econPoints(E_LATE), 9);
+await superMessage(speaker(E_ADMIN, "en"), 9203, command("/lang ru"));
+assert.deepEqual([chatDoc(ECON).lang, chatDoc(SUPER).lang], ["ru", undefined]);
+assert.equal(lastText(SUPER), "Язык чата: русский. Теперь я пишу здесь по-русски.");
+await superMessage(speaker(CREATOR, "en"), 9204, command("/jetton"));
+assert.equal(lastText(SUPER), t("ru", "jettonCurrent", JETTON));
+await superMessage(speaker(CREATOR, "en"), 9205, command("/verify"));
+assert.equal(chatDoc(ECON).creator, CREATOR);
+assert.deepEqual(underSuper("grants"), []);
+// announcements of the economy go to the supergroup; nothing is sent to the
+// dead group
+await queue(ECON, "price_increased", {from: "0.01", to: "0.02", symbol: "E", cancelled_pending: false}, {created_at: minutes(58)});
+await run(minutes(58));
+assert.equal(textsTo(SUPER).at(-1), "Цена балла выросла: 1 балл = 0,02 E (было 0,01).");
+assert.equal(sendAttempts.filter(id => id === ECON).length, 0);
+// a Stars invoice for the economy asks the supergroup who its creator is,
+// and one made out to the supergroup's id pays for the economy
+memberLookups.length = 0;
+await bot.handleUpdate({update_id: ++updateId, pre_checkout_query: {id: "q-econ", from: user(CREATOR), currency: "XTR",
+  total_amount: 300, invoice_payload: `sub:${ECON}`}});
+await bot.handleUpdate({update_id: ++updateId, pre_checkout_query: {id: "q-super", from: user(CREATOR), currency: "XTR",
+  total_amount: 300, invoice_payload: `sub:${SUPER}`}});
+assert.deepEqual(memberLookups, [SUPER, SUPER]);
+statuses.delete(CREATOR);
+statuses.delete(E_ADMIN);
+upgradedGroups.delete(ECON);
+
+// A chat recorded as migrated before the alias existed (migrated_to_chat_id
+// and migration_needs_review only) is confirmed and aliased by the pass.
+const LEGACY = -2961, LEGACY_SUPER = -1002961;
+await chatsColl.insertOne({id: LEGACY, title: "Legacy", jetton_master: JETTON, migrated_to_chat_id: LEGACY_SUPER,
+  migrated_at: minutes(-60), migration_needs_review: true});
+await chatsColl.insertOne({id: LEGACY_SUPER, migrated_from_chat_id: LEGACY});
+await giveReward(LEGACY_SUPER, 6801, 2);
+await giveReward(LEGACY, 6801, 3);
+upgradedGroups.set(LEGACY, LEGACY_SUPER);
+const legacyBot = createBot(database, "1:x"); // a fresh process: its first pass looks for them
+await legacyBot.announcements.run(minutes(59));
+assert.deepEqual([chatDoc(LEGACY).telegram_chat_id, chatDoc(LEGACY).migration_needs_review, chatDoc(LEGACY).migrated_at.getTime(),
+  chatDoc(LEGACY_SUPER).economy_chat_id], [LEGACY_SUPER, undefined, minutes(-60).getTime(), LEGACY]);
+assert.deepEqual([rewardsIn(LEGACY), rewardsIn(LEGACY_SUPER)], [[[6801, 5]], []]);
+assert.equal(migrationRow(LEGACY, LEGACY_SUPER).source, "recorded");
+upgradedGroups.delete(LEGACY);
 
 // The bot's own "price decreased" goes through the outbox: a failed send is
 // retried on the next pass.
@@ -1743,17 +1991,53 @@ Telegram.prototype.callApi = plainCallApi;
 // ---- Startup environment ----
 // Production needs the database, the token and the webhook domain; without
 // Grafana it starts with a warning. Development needs nothing.
-const {checkEnv} = await import("../env.mjs");
+const {checkEnv, webhookOptions, webhookSecret} = await import("../env.mjs");
 const PROD = {NODE_ENV: "production", MONGODB_URI: "mongodb://db", ACHIVATOR_TOKEN: "1:x", WEBHOOK_URL: "bot.example.com"};
 assert.deepEqual(checkEnv(PROD),
-  {missing: [], warnings: ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_USER_ID, ACHIVATOR_GRAFANA_TOKEN"]});
-assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}), {missing: [], warnings: []});
+  {missing: [], invalid: [], warnings: ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_USER_ID, ACHIVATOR_GRAFANA_TOKEN"]});
+assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}), {missing: [], invalid: [], warnings: []});
 assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1"}).warnings,
   ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_TOKEN"]);
 assert.deepEqual(checkEnv({NODE_ENV: "production", ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}).missing,
   ["MONGODB_URI", "ACHIVATOR_TOKEN", "WEBHOOK_URL"]);
 assert.deepEqual(checkEnv({...PROD, WEBHOOK_URL: ""}).missing, ["WEBHOOK_URL"]);
-assert.deepEqual(checkEnv({NODE_ENV: "development"}), {missing: [], warnings: []});
+assert.deepEqual(checkEnv({NODE_ENV: "development"}), {missing: [], invalid: [], warnings: []});
+
+// ---- Webhook secret ----
+// WEBHOOK_SECRET when set (Telegram's alphabet only), else a hash of the
+// token: stable across restarts, different per bot, never the token itself.
+assert.deepEqual(checkEnv({...PROD, WEBHOOK_SECRET: "has spaces"}).invalid, ["WEBHOOK_SECRET"]);
+assert.deepEqual(checkEnv({...PROD, WEBHOOK_SECRET: "a".repeat(257)}).invalid, ["WEBHOOK_SECRET"]);
+assert.deepEqual(checkEnv({...PROD, WEBHOOK_SECRET: "Ok_secret-1"}).invalid, []);
+assert.equal(webhookSecret({...PROD, WEBHOOK_SECRET: "Ok_secret-1"}), "Ok_secret-1");
+const derived = webhookSecret(PROD);
+assert.match(derived, /^[0-9a-f]{64}$/);
+assert.equal(webhookSecret({...PROD}), derived);
+assert.notEqual(webhookSecret({...PROD, ACHIVATOR_TOKEN: "2:y"}), derived);
+assert.ok(!derived.includes("1:x"));
+assert.deepEqual(webhookOptions({...PROD, PORT: "8080"}), {domain: "bot.example.com", port: 8080, secretToken: derived});
+
+// telegraf, given that secretToken (standalone.mjs launches with
+// webhookOptions), answers 403 to an update without the header or with a
+// wrong one, and handles only the one Telegram signs.
+const hooked = [];
+const webhookBot = createBot(database, "1:x");
+webhookBot.botInfo = bot.botInfo;
+webhookBot.use(ctx => hooked.push(ctx.update.update_id));
+const hook = webhookBot.webhookCallback("/hook", {secretToken: derived});
+const postUpdate = async headers => {
+  const body = JSON.stringify({update_id: 777001, message: {message_id: 1, date: 1, chat: {id: 5, type: "private"}, from: user(5), text: "hi"}});
+  const req = {method: "POST", url: "/hook", headers, body: Buffer.from(body)};
+  const res = {statusCode: 200, headersSent: false, writeHead(code) { this.statusCode = code; return this; },
+    setHeader() {}, end() { this.ended = true; return this; }};
+  await hook(req, res);
+  return res.statusCode;
+};
+assert.equal(await postUpdate({}), 403, "no secret header");
+assert.equal(await postUpdate({"x-telegram-bot-api-secret-token": "guess"}), 403, "wrong secret");
+assert.deepEqual(hooked, []);
+assert.equal(await postUpdate({"x-telegram-bot-api-secret-token": derived}), 200);
+assert.deepEqual(hooked, [777001]);
 
 console.log = originalLog;
 console.log("ALL OK");
