@@ -617,9 +617,11 @@ export default function createBot(database, token, options) {
   // compared, being in different jettons. Its history entry snapshots
   // maturation_days 0, so the mini app's lot pricing (a lot maturing at a
   // decrease keeps the price before it) protects no lot at the switch: an
-  // old-jetton price must never be paid in the new jetton. `reason`,
-  // `old_jetton` and `new_jetton` are extra fields the mini app's readers
-  // ignore.
+  // old-jetton price must never be paid in the new jetton. For the same
+  // reason the mini app lets no decrease before the latest entry with
+  // `reason: "jetton_changed"` protect a lot, so the entry is written even
+  // when the price stays the same number (a chat already on the default).
+  // `old_jetton` and `new_jetton` are for the record.
 
   // The platform default point price in force at `now`, as the mini app pays
   // it: the default it stores (settings "point_price_default", kept in step
@@ -678,7 +680,7 @@ export default function createBot(database, token, options) {
     }
     if (platform === null) {
       console.error(`chat ${chat.id}: the platform default price is not a positive decimal, the price reset is not in the history`);
-    } else if (before !== null && !sameDecimal(before, platform)) {
+    } else if (before !== null) {
       history.push({
         old: before,
         new: platform,

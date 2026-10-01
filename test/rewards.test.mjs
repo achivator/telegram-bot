@@ -1532,8 +1532,9 @@ assert.equal(switchRows().length, 1);
 assert.deepEqual(switchChat().point_price_confirm_required, confirm);
 
 // A decrease already due goes into the history before the reset; a chat
-// already at the default price gets no reset entry. The default comes from
-// JETTONS_PER_POINT until the mini app has stored one.
+// already on the default gets a reset entry at the same price (the switch
+// still ends the old jetton's decreases for the mini app). The default comes
+// from JETTONS_PER_POINT until the mini app has stored one.
 process.env.JETTONS_PER_POINT = "0.10";
 const dueAt = new Date(Date.now() - DAY_MS);
 await chatsColl.updateOne({id: SWITCH.id}, {$set: {point_price_pending: {price: "0.15", to_default: false, from: "0.2",
@@ -1552,7 +1553,9 @@ const SWITCH_RU = {id: -961, type: "supergroup", title: "Смена"};
 await chatsColl.insertOne({id: SWITCH_RU.id, jetton_master: OLD_JETTON, creator: SWITCH_OWNER, lang: "ru"});
 await inChat(SWITCH_RU, speaker(SWITCH_OWNER, "ru"), command(`/jetton ${NEW_JETTON}`));
 const ruChat = chatsColl.docs.find(d => d.id === SWITCH_RU.id);
-assert.equal(ruChat.point_price_history, undefined, "no price of its own: nothing to record");
+assert.deepEqual(ruChat.point_price_history.map(h => ({...h, at: null})), [{old: "0.1", new: "0.1", at: null, by: SWITCH_OWNER,
+  maturation_days: 0, reason: "jetton_changed", old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, from_default: true}],
+  "no price of its own: the switch is recorded at the same price");
 assert.equal(ruChat.point_price_confirm_required.old_price, "0.1");
 assert.equal(lastText(SWITCH_RU.id),
   `Жетон для наград изменён: ${NEW_JETTON}\n(был ${OLD_JETTON})\n\n` +
