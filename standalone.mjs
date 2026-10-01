@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import createBot from "./index.mjs";
-import { checkEnv } from "./env.mjs";
+import { checkEnv, webhookOptions } from "./env.mjs";
 import { MongoClient } from "mongodb";
 
 dotenv.config();
@@ -8,11 +8,15 @@ dotenv.config();
 const isProduction = process.env.NODE_ENV === "production";
 const isTelegramTestEnvironment = process.env.TELEGRAM_TEST_ENV === "true";
 
-const { missing: missingEnv, warnings } = checkEnv(process.env);
+const { missing: missingEnv, invalid: invalidEnv, warnings } = checkEnv(process.env);
 for (const warning of warnings) console.warn(warning);
 
 if (missingEnv.length > 0) {
   console.error("Missing ENV var:", missingEnv.join(", "));
+  process.exit(1);
+}
+if (invalidEnv.length > 0) {
+  console.error("Invalid ENV var (WEBHOOK_SECRET: 1-256 of A-Z a-z 0-9 _ -):", invalidEnv.join(", "));
   process.exit(1);
 }
 
@@ -29,12 +33,11 @@ const bot = createBot(database, process.env.ACHIVATOR_TOKEN, {
   },
 });
 
+// The webhook only takes updates that carry its secret token (env.mjs):
+// telegraf answers 403 to any other request.
 const botOptions = isProduction
   ? {
-      webhook: {
-        domain: process.env.WEBHOOK_URL,
-        port: parseInt(process.env.PORT || "3000", 10),
-      },
+      webhook: webhookOptions(process.env),
     }
   : {
       polling: { timeout: 30, limit: 10 },

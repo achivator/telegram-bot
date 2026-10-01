@@ -1743,17 +1743,53 @@ Telegram.prototype.callApi = plainCallApi;
 // ---- Startup environment ----
 // Production needs the database, the token and the webhook domain; without
 // Grafana it starts with a warning. Development needs nothing.
-const {checkEnv} = await import("../env.mjs");
+const {checkEnv, webhookOptions, webhookSecret} = await import("../env.mjs");
 const PROD = {NODE_ENV: "production", MONGODB_URI: "mongodb://db", ACHIVATOR_TOKEN: "1:x", WEBHOOK_URL: "bot.example.com"};
 assert.deepEqual(checkEnv(PROD),
-  {missing: [], warnings: ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_USER_ID, ACHIVATOR_GRAFANA_TOKEN"]});
-assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}), {missing: [], warnings: []});
+  {missing: [], invalid: [], warnings: ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_USER_ID, ACHIVATOR_GRAFANA_TOKEN"]});
+assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}), {missing: [], invalid: [], warnings: []});
 assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1"}).warnings,
   ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_TOKEN"]);
 assert.deepEqual(checkEnv({NODE_ENV: "production", ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}).missing,
   ["MONGODB_URI", "ACHIVATOR_TOKEN", "WEBHOOK_URL"]);
 assert.deepEqual(checkEnv({...PROD, WEBHOOK_URL: ""}).missing, ["WEBHOOK_URL"]);
-assert.deepEqual(checkEnv({NODE_ENV: "development"}), {missing: [], warnings: []});
+assert.deepEqual(checkEnv({NODE_ENV: "development"}), {missing: [], invalid: [], warnings: []});
+
+// ---- Webhook secret ----
+// WEBHOOK_SECRET when set (Telegram's alphabet only), else a hash of the
+// token: stable across restarts, different per bot, never the token itself.
+assert.deepEqual(checkEnv({...PROD, WEBHOOK_SECRET: "has spaces"}).invalid, ["WEBHOOK_SECRET"]);
+assert.deepEqual(checkEnv({...PROD, WEBHOOK_SECRET: "a".repeat(257)}).invalid, ["WEBHOOK_SECRET"]);
+assert.deepEqual(checkEnv({...PROD, WEBHOOK_SECRET: "Ok_secret-1"}).invalid, []);
+assert.equal(webhookSecret({...PROD, WEBHOOK_SECRET: "Ok_secret-1"}), "Ok_secret-1");
+const derived = webhookSecret(PROD);
+assert.match(derived, /^[0-9a-f]{64}$/);
+assert.equal(webhookSecret({...PROD}), derived);
+assert.notEqual(webhookSecret({...PROD, ACHIVATOR_TOKEN: "2:y"}), derived);
+assert.ok(!derived.includes("1:x"));
+assert.deepEqual(webhookOptions({...PROD, PORT: "8080"}), {domain: "bot.example.com", port: 8080, secretToken: derived});
+
+// telegraf, given that secretToken (standalone.mjs launches with
+// webhookOptions), answers 403 to an update without the header or with a
+// wrong one, and handles only the one Telegram signs.
+const hooked = [];
+const webhookBot = createBot(database, "1:x");
+webhookBot.botInfo = bot.botInfo;
+webhookBot.use(ctx => hooked.push(ctx.update.update_id));
+const hook = webhookBot.webhookCallback("/hook", {secretToken: derived});
+const postUpdate = async headers => {
+  const body = JSON.stringify({update_id: 777001, message: {message_id: 1, date: 1, chat: {id: 5, type: "private"}, from: user(5), text: "hi"}});
+  const req = {method: "POST", url: "/hook", headers, body: Buffer.from(body)};
+  const res = {statusCode: 200, headersSent: false, writeHead(code) { this.statusCode = code; return this; },
+    setHeader() {}, end() { this.ended = true; return this; }};
+  await hook(req, res);
+  return res.statusCode;
+};
+assert.equal(await postUpdate({}), 403, "no secret header");
+assert.equal(await postUpdate({"x-telegram-bot-api-secret-token": "guess"}), 403, "wrong secret");
+assert.deepEqual(hooked, []);
+assert.equal(await postUpdate({"x-telegram-bot-api-secret-token": derived}), 200);
+assert.deepEqual(hooked, [777001]);
 
 console.log = originalLog;
 console.log("ALL OK");
