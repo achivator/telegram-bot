@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import createBot from "./index.mjs";
+import { checkEnv } from "./env.mjs";
 import { MongoClient } from "mongodb";
 
 dotenv.config();
@@ -7,15 +8,10 @@ dotenv.config();
 const isProduction = process.env.NODE_ENV === "production";
 const isTelegramTestEnvironment = process.env.TELEGRAM_TEST_ENV === "true";
 
-const missingEnv = [
-  "MONGODB_URI",
-  "ACHIVATOR_GRAFANA_USER_ID",
-  "ACHIVATOR_GRAFANA_TOKEN",
-  "ACHIVATOR_TOKEN",
-  "WEBHOOK_URL",
-].filter((e) => !process.env[e]);
+const { missing: missingEnv, warnings } = checkEnv(process.env);
+for (const warning of warnings) console.warn(warning);
 
-if (isProduction && missingEnv.length > 0) {
+if (missingEnv.length > 0) {
   console.error("Missing ENV var:", missingEnv.join(", "));
   process.exit(1);
 }
@@ -64,7 +60,8 @@ bot.launch({ ...botOptions, allowedUpdates });
 // decreases that fall due (ANNOUNCE_INTERVAL_MS).
 bot.announcements.start();
 // Private messages to members (price decrease reminders), at most
-// DM_RATE_PER_SEC per second, checked every DM_INTERVAL_MS.
+// DM_RATE_PER_SEC per second, checked every DM_INTERVAL_MS while there is
+// work and up to every DM_MAX_IDLE_MS while there is none.
 bot.dms.start();
 
 // Enable graceful stop
@@ -72,6 +69,13 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, () => {
     bot.announcements.stop();
     bot.dms.stop();
-    bot.stop(signal);
+    try {
+      bot.stop(signal);
+    } catch {
+      // "Bot is not running!": the signal came before launch finished (e.g.
+      // a Coolify restart during startup). Nothing is in flight yet, and
+      // launch would otherwise go on to start the bot.
+      process.exit(0);
+    }
   });
 }

@@ -46,6 +46,17 @@ function ruDecimal(value) {
   return String(value).replace(".", ",");
 }
 
+// 1 point, 2 points, 1.5 points
+function enPoints(points) {
+  return `${points} ${points === "1" ? "point" : "points"}`;
+}
+
+// 1 балл созреет, 3 балла созреют
+function ruMature(points) {
+  const n = Number(points);
+  return Number.isInteger(n) ? ruPlural(n, "созреет", "созреют", "созреют") : "созреют";
+}
+
 // "В чате «Мемы»", or "В одном из ваших чатов" when the title is unknown
 function ruInChat(title) {
   return title ? `В чате «${title}»` : "В одном из ваших чатов";
@@ -55,6 +66,11 @@ function ruInChat(title) {
 function ruPointsWord(points) {
   const n = Number(points);
   return Number.isInteger(n) ? ruPlural(n, "балл", "балла", "баллов") : "балла";
+}
+
+// "MEME (EQ...)", or the bare address when the symbol is unknown
+function jettonLabel(address, symbol) {
+  return symbol ? `${symbol} (${address})` : address;
 }
 
 const en = {
@@ -85,6 +101,7 @@ const en = {
     "own jetton, and along the way members unlock achievements.\n\n" +
     "To set it up: add me to your group, make me an admin and follow the setup guide.",
   buttonOpenApp: "Open the app",
+  buttonGetReminders: "🔔 Get reminders",
   buttonAddToGroup: "Add to a group",
   buttonSetupGuide: "Setup guide",
   setupGuideUrl: "https://achivator.cc/en/help",
@@ -135,6 +152,27 @@ const en = {
     "1. Open the mini app and activate the chat pool (one-time, 0.3 TON).\n" +
     "2. Top up the pool with your jettons.\n" +
     "Members will then earn points for positive reactions and claim them as jettons.",
+  // /jetton to another jetton: the reply to the creator, and the chat's
+  // announcement (the outbox row "jetton_changed"). `price_reset`: the chat
+  // had a price of its own, now dropped; `old_price` is what it was.
+  jettonChanged: ({old_jetton, new_jetton, price_reset, cancelled_pending}) =>
+    `Reward jetton changed: ${new_jetton}\n(was ${old_jetton})\n\n` +
+    (price_reset
+      ? "The price of a point is reset to the platform default: the old price was in the old jetton. "
+      : "The price of a point is the platform default. ") +
+    "Set a price in the new jetton in the mini app." +
+    (cancelled_pending ? "\nThe planned price decrease is cancelled." : "") +
+    "\n\nUnclaimed points are now paid in the new jetton: top up the pool with it. " +
+    "The old jetton left in the pool stays there; only the pool admin can withdraw it.",
+  jettonChangedAnnouncement: ({old_jetton, new_jetton, old_symbol, new_symbol, old_price, price_reset, cancelled_pending}) =>
+    "The reward jetton of this chat has changed.\n" +
+    `Was: ${jettonLabel(old_jetton, old_symbol)}\nNow: ${jettonLabel(new_jetton, new_symbol)}\n\n` +
+    (price_reset
+      ? `The price of a point (was ${old_price} ${old_symbol || "jetton"}) is reset to the platform default ` +
+        "until the creator sets a new one in the mini app."
+      : "The price of a point stays at the platform default until the creator sets one in the mini app.") +
+    (cancelled_pending ? "\nThe planned price decrease is cancelled." : "") +
+    "\nUnclaimed points are now paid in the new jetton.",
 
   verifyWhere: "Run /verify in the group you created.",
   verifyCannotCheck: "I cannot check your status here. Make sure I am an admin of this chat.",
@@ -143,9 +181,10 @@ const en = {
 
   langCurrent: languageName => `Chat language: ${languageName}.`,
   langNotSet: "Chat language is not set: I reply in the language of each member's Telegram app.",
-  langUsage: "To change it (creator and admins): /lang ru or /lang en",
-  langUnknown: value => `I don't speak "${value}" yet. Available: /lang ru or /lang en`,
+  langUsage: "To change it (creator and admins): /lang ru, /lang en, or /lang auto to follow each member's app",
+  langUnknown: value => `I don't speak "${value}" yet. Available: /lang ru, /lang en or /lang auto`,
   langSet: languageName => `Chat language set: ${languageName}. I will write here in English.`,
+  langAuto: "Chat language reset: I reply in the language of each member's Telegram app.",
   langAdminsOnly: "Only the chat creator and admins can change the chat language (I must be an admin to check).",
   langPrivate:
     "In a private chat I use the language of your Telegram app.\n" +
@@ -159,7 +198,7 @@ const en = {
     `The price of a point will drop on ${utcDateTime(effective_at, EN_MONTHS)}: ` +
     `1 point = ${from} → ${to} ${symbol || "jetton"}.\n` +
     "Points already earned can be claimed at the current price until then — open the mini app.\n" +
-    "Start @achivator_bot in private to get personal reminders.",
+    "Tap “Get reminders” to be reminded in private.",
   priceDecreased: ({from, to, symbol}) =>
     `The price of a point has dropped: 1 point = ${to} ${symbol || "jetton"} (was ${from}).`,
   priceIncreased: ({from, to, symbol, cancelled_pending}) =>
@@ -168,17 +207,57 @@ const en = {
   priceDecreaseCancelled: ({from, symbol}) =>
     `The planned price decrease is cancelled: 1 point stays ${from} ${symbol || "jetton"}.`,
 
-  // The same changes, in private to each member with unclaimed points.
-  // `points` and `estimate` (points × the current price) are decimal strings.
-  dmPriceDecreaseScheduled: ({chat_title, from, to, symbol, effective_at, points, estimate}) =>
-    `In ${chat_title || "one of your chats"}, the price of a point drops on ${utcDateTime(effective_at, EN_MONTHS)}: ` +
-    `1 point = ${from} → ${to} ${symbol || "jetton"}.\n` +
-    `You have ${points} ${points === "1" ? "point" : "points"} ` +
-    `(≈ ${estimate} ${symbol || "jetton"} at the current price). ` +
-    "Claim them before then to keep the current rate.",
+  // The same changes, in private to each member with points the decrease
+  // would cost. Decimal strings: `points` claimable now and `estimate` their
+  // worth at the current price, `maturing` claimable before the drop
+  // (`maturing_estimate`), `protected` still maturing at the drop (they keep
+  // the current price). Rows queued before the split have only `points`.
+  dmPriceDecreaseScheduled: ({chat_title, from, to, symbol, effective_at, points, estimate, ...more}) => {
+    const {maturing = "0", maturing_estimate: maturingEstimate, protected: kept = "0"} = more;
+    const lines = [
+      `In ${chat_title || "one of your chats"}, the price of a point drops on ${utcDateTime(effective_at, EN_MONTHS)}: ` +
+        `1 point = ${from} → ${to} ${symbol || "jetton"}.`,
+    ];
+    if (points !== "0") {
+      lines.push(
+        `You have ${enPoints(points)} to claim now (≈ ${estimate} ${symbol || "jetton"} at the current price): ` +
+          "claim them before then to keep the current rate.",
+      );
+    }
+    if (maturing !== "0") {
+      lines.push(
+        `${points !== "0" ? `${maturing} more ${maturing === "1" ? "point" : "points"}` : enPoints(maturing)} ` +
+          `${maturing === "1" ? "matures" : "mature"} before then ` +
+          `(≈ ${maturingEstimate} ${symbol || "jetton"}): claim them as soon as they do.`,
+      );
+    }
+    if (kept !== "0") {
+      lines.push(`${enPoints(kept)} still maturing at the drop ${kept === "1" ? "keeps" : "keep"} the current price anyway.`);
+    }
+    return lines.join("\n");
+  },
   dmPriceDecreaseCancelled: ({chat_title, from, symbol}) =>
     `In ${chat_title || "one of your chats"}, the planned price drop is cancelled; ` +
     `1 point stays ${from} ${symbol || "jetton"}.`,
+  dmPriceIncreaseCancelsDecrease: ({chat_title, from, to, symbol}) =>
+    `In ${chat_title || "one of your chats"}, the planned price drop is cancelled: the price of a point has gone up, ` +
+    `1 point = ${to} ${symbol || "jetton"} (was ${from}).`,
+  // under the first reminder a member ever gets
+  dmNotifyHint: "You get these reminders because you have points in this chat. To stop them, send /notify off.",
+  // to the creator who scheduled a decrease, once its reminders are out
+  dmReachSummary: ({chat_title, effective_at, sent, unreachable, opted_out, failed}) =>
+    `Reminders about the price drop in ${chat_title || "your chat"} on ${utcDateTime(effective_at, EN_MONTHS)}: ` +
+    `${sent} sent, ${unreachable} unreachable (never started the bot or blocked it), ${opted_out} turned off` +
+    (failed ? `, ${failed} failed.` : "."),
+
+  // /notify and /start remind, in private
+  remindersOn:
+    "Reminders are on: I'll write to you here before the price of your points drops in your chats. " +
+    "To stop them: /notify off",
+  notifyOff: "Reminders are off: I won't write to you before the price of your points drops. To turn them back on: /notify on",
+  notifyStatusOn: "Price drop reminders are on. To turn them off: /notify off",
+  notifyStatusOff: "Price drop reminders are off. To turn them on: /notify on",
+  notifyPrivate: "Send /notify to me in a private chat: it turns your price drop reminders on or off.",
 
   // Service subscription (Telegram Stars). Claiming points already earned
   // never depends on it. `title` is the chat title, `until` a date.
@@ -211,7 +290,8 @@ const en = {
   commandVerify: "Verify creator status",
   commandJetton: "Set the reward jetton for this chat (creators)",
   commandReward: "Grant points to a member (admins)",
-  commandLang: "Set the chat language: /lang ru or /lang en (admins)",
+  commandLang: "Set the chat language: /lang ru, en or auto (admins)",
+  commandNotify: "Price drop reminders: /notify on or off",
 };
 
 const RU_MEMBER_STATUSES = {
@@ -251,6 +331,7 @@ const ru = {
     "собственным жетоном чата, а по пути участники открывают достижения.\n\n" +
     "Как подключить: добавьте меня в группу, сделайте администратором и следуйте инструкции по настройке.",
   buttonOpenApp: "Открыть приложение",
+  buttonGetReminders: "🔔 Получать напоминания",
   buttonAddToGroup: "Добавить в группу",
   buttonSetupGuide: "Инструкция по настройке",
   setupGuideUrl: "https://achivator.cc/ru/help",
@@ -304,6 +385,24 @@ const ru = {
     "1. Откройте мини-приложение и активируйте пул чата (один раз, 0,3 TON).\n" +
     "2. Пополните пул своими жетонами.\n" +
     "После этого участники будут получать баллы за положительные реакции и забирать их жетонами.",
+  jettonChanged: ({old_jetton, new_jetton, price_reset, cancelled_pending}) =>
+    `Жетон для наград изменён: ${new_jetton}\n(был ${old_jetton})\n\n` +
+    (price_reset
+      ? "Цена балла сброшена до стандартной цены платформы: прежняя цена была в старом жетоне. "
+      : "Цена балла — стандартная цена платформы. ") +
+    "Задайте цену в новом жетоне в мини-приложении." +
+    (cancelled_pending ? "\nЗапланированное снижение цены отменено." : "") +
+    "\n\nНезабранные баллы теперь выплачиваются новым жетоном — пополните им пул. " +
+    "Остаток старого жетона остаётся в пуле; вывести его может только администратор пула.",
+  jettonChangedAnnouncement: ({old_jetton, new_jetton, old_symbol, new_symbol, old_price, price_reset, cancelled_pending}) =>
+    "Жетон для наград в этом чате изменён.\n" +
+    `Был: ${jettonLabel(old_jetton, old_symbol)}\nТеперь: ${jettonLabel(new_jetton, new_symbol)}\n\n` +
+    (price_reset
+      ? `Цена балла (была ${ruDecimal(old_price)} ${old_symbol || "жетона"}) сброшена до стандартной цены платформы, ` +
+        "пока создатель не задаст новую в мини-приложении."
+      : "Цена балла остаётся стандартной ценой платформы, пока создатель не задаст свою в мини-приложении.") +
+    (cancelled_pending ? "\nЗапланированное снижение цены отменено." : "") +
+    "\nНезабранные баллы теперь выплачиваются новым жетоном.",
 
   verifyWhere: "Выполните /verify в группе, которую вы создали.",
   verifyCannotCheck: "Не могу проверить ваш статус. Убедитесь, что я администратор этого чата.",
@@ -313,9 +412,11 @@ const ru = {
 
   langCurrent: languageName => `Язык чата: ${languageName}.`,
   langNotSet: "Язык чата не задан: я отвечаю каждому на языке его приложения Telegram.",
-  langUsage: "Изменить (создатель и администраторы): /lang ru или /lang en",
-  langUnknown: value => `Язык «${value}» я пока не знаю. Доступны: /lang ru или /lang en`,
+  langUsage:
+    "Изменить (создатель и администраторы): /lang ru, /lang en или /lang auto — по языку приложения каждого участника",
+  langUnknown: value => `Язык «${value}» я пока не знаю. Доступны: /lang ru, /lang en или /lang auto`,
   langSet: languageName => `Язык чата: ${languageName}. Теперь я пишу здесь по-русски.`,
+  langAuto: "Язык чата сброшен: я отвечаю каждому на языке его приложения Telegram.",
   langAdminsOnly:
     "Менять язык чата могут только создатель и администраторы (чтобы это проверить, я должен быть администратором).",
   langPrivate:
@@ -328,7 +429,7 @@ const ru = {
     `Цена балла снизится ${utcDateTime(effective_at, RU_MONTHS)}: ` +
     `1 балл = ${ruDecimal(from)} → ${ruDecimal(to)} ${symbol || "жетона"}.\n` +
     "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.\n" +
-    "Чтобы получать личные напоминания, запустите @achivator_bot в личных сообщениях.",
+    "Нажмите «Получать напоминания», чтобы получить напоминание в личных сообщениях.",
   priceDecreased: ({from, to, symbol}) =>
     `Цена балла снизилась: 1 балл = ${ruDecimal(to)} ${symbol || "жетона"} (было ${ruDecimal(from)}).`,
   priceIncreased: ({from, to, symbol, cancelled_pending}) =>
@@ -337,15 +438,53 @@ const ru = {
   priceDecreaseCancelled: ({from, symbol}) =>
     `Запланированное снижение цены балла отменено: 1 балл по-прежнему стоит ${ruDecimal(from)} ${symbol || "жетона"}.`,
 
-  dmPriceDecreaseScheduled: ({chat_title, from, to, symbol, effective_at, points, estimate}) =>
-    `${ruInChat(chat_title)} цена балла снизится ${utcDateTime(effective_at, RU_MONTHS)}: ` +
-    `1 балл = ${ruDecimal(from)} → ${ruDecimal(to)} ${symbol || "жетона"}.\n` +
-    `У вас ${ruDecimal(points)} ${ruPointsWord(points)} ` +
-    `(≈ ${ruDecimal(estimate)} ${symbol || "жетона"} по текущей цене). ` +
-    "Заберите их до этого времени, чтобы сохранить текущий курс.",
+  dmPriceDecreaseScheduled: ({chat_title, from, to, symbol, effective_at, points, estimate, ...more}) => {
+    const {maturing = "0", maturing_estimate: maturingEstimate, protected: kept = "0"} = more;
+    const lines = [
+      `${ruInChat(chat_title)} цена балла снизится ${utcDateTime(effective_at, RU_MONTHS)}: ` +
+        `1 балл = ${ruDecimal(from)} → ${ruDecimal(to)} ${symbol || "жетона"}.`,
+    ];
+    if (points !== "0") {
+      lines.push(
+        `Сейчас можно забрать ${ruDecimal(points)} ${ruPointsWord(points)} ` +
+          `(≈ ${ruDecimal(estimate)} ${symbol || "жетона"} по текущей цене): ` +
+          "заберите их до этого времени, чтобы сохранить текущий курс.",
+      );
+    }
+    if (maturing !== "0") {
+      lines.push(
+        `${points !== "0" ? "Ещё " : ""}${ruDecimal(maturing)} ${ruPointsWord(maturing)} ${ruMature(maturing)} до этого времени ` +
+          `(≈ ${ruDecimal(maturingEstimate)} ${symbol || "жетона"}): заберите их, как только они станут доступны.`,
+      );
+    }
+    if (kept !== "0") {
+      lines.push(
+        `Баллы, которые ещё будут созревать в момент снижения (${ruDecimal(kept)}), в любом случае сохранят текущую цену.`,
+      );
+    }
+    return lines.join("\n");
+  },
   dmPriceDecreaseCancelled: ({chat_title, from, symbol}) =>
     `${ruInChat(chat_title)} запланированное снижение цены балла отменено: ` +
     `1 балл по-прежнему стоит ${ruDecimal(from)} ${symbol || "жетона"}.`,
+  dmPriceIncreaseCancelsDecrease: ({chat_title, from, to, symbol}) =>
+    `${ruInChat(chat_title)} запланированное снижение цены балла отменено: цена выросла, ` +
+    `1 балл = ${ruDecimal(to)} ${symbol || "жетона"} (было ${ruDecimal(from)}).`,
+  dmNotifyHint:
+    "Вы получаете такие напоминания, потому что у вас есть баллы в этом чате. Чтобы отключить их, отправьте /notify off.",
+  dmReachSummary: ({chat_title, effective_at, sent, unreachable, opted_out, failed}) =>
+    `Напоминания о снижении цены ${chat_title ? `в чате «${chat_title}»` : "в вашем чате"} ` +
+    `${utcDateTime(effective_at, RU_MONTHS)}: отправлено ${sent}, не доставлено ${unreachable} ` +
+    `(бот не запущен или заблокирован), отключили ${opted_out}` +
+    (failed ? `, ошибок ${failed}.` : "."),
+
+  remindersOn:
+    "Напоминания включены: я напишу вам здесь, прежде чем цена ваших баллов в ваших чатах снизится. " +
+    "Отключить: /notify off",
+  notifyOff: "Напоминания отключены: я не буду писать вам перед снижением цены баллов. Включить снова: /notify on",
+  notifyStatusOn: "Напоминания о снижении цены включены. Отключить: /notify off",
+  notifyStatusOff: "Напоминания о снижении цены отключены. Включить: /notify on",
+  notifyPrivate: "Отправьте /notify мне в личные сообщения: так включаются и отключаются напоминания о снижении цены.",
 
   subscriptionInactive:
     "Начисление баллов в этом чате приостановлено: подписка Achivator не оплачена. " +
@@ -377,7 +516,8 @@ const ru = {
   commandVerify: "Подтвердить, что вы создатель чата",
   commandJetton: "Задать жетон для наград в этом чате (создатель)",
   commandReward: "Начислить баллы участнику (администраторы)",
-  commandLang: "Язык чата: /lang ru или /lang en (администраторы)",
+  commandLang: "Язык чата: /lang ru, en или auto (администраторы)",
+  commandNotify: "Напоминания о снижении цены: /notify on или off",
 };
 
 const DICTIONARIES = {en, ru};

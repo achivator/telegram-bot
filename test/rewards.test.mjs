@@ -8,7 +8,7 @@ const commandMenus = [];
 // chat member status by user id ("member" when unset); "error" makes the
 // lookup fail, as it does for an anonymous admin
 const statuses = new Map();
-// sendMessage to these chats fails, as it does once the bot is removed
+// sendMessage to these chats fails, as it does while Telegram is unreachable
 const failingChats = new Set();
 const sendAttempts = [];
 // private messages to these users fail with the error the function returns
@@ -21,7 +21,8 @@ Telegram.prototype.callApi = async function (method, payload) {
   }
   if (method === "sendMessage") {
     sendAttempts.push(payload.chat_id);
-    if (failingChats.has(payload.chat_id)) throw new Error("Forbidden: bot was kicked from the group chat");
+    if (failingChats.has(payload.chat_id)) throw new Error("connect ETIMEDOUT");
+    // any chat, despite the name: a TelegramError with a code and parameters
     if (dmFailures.has(payload.chat_id)) throw dmFailures.get(payload.chat_id)();
     sent.push(payload);
     return {message_id: 1};
@@ -47,7 +48,8 @@ const OPS = {
 const isOps = v => v && typeof v === "object" && !(v instanceof Date) && Object.keys(v).every(k => k in OPS);
 const test = (x, v) =>
   isOps(v) ? Object.entries(v).every(([op, arg]) => OPS[op](x, arg)) : v === null ? x == null : same(x, v);
-const matches = (doc, filter) => Object.entries(filter).every(([k, v]) => test(get(doc, k), v));
+const matches = (doc, filter) =>
+  Object.entries(filter).every(([k, v]) => (k === "$or" ? v.some(f => matches(doc, f)) : test(get(doc, k), v)));
 const dup = () => Object.assign(new Error("E11000"), {code: 11000});
 
 class Coll {
@@ -65,7 +67,9 @@ class Coll {
     const cursor = {
       sort(spec) { const [[k, dir]] = Object.entries(spec); docs.sort((a, b) => (get(a, k) < get(b, k) ? -dir : get(a, k) > get(b, k) ? dir : 0)); return cursor; },
       limit(n) { docs = docs.slice(0, n); return cursor; },
+      batchSize() { return cursor; },
       async toArray() { return docs; },
+      async *[Symbol.asyncIterator]() { yield* docs; },
     };
     return cursor;
   }
@@ -81,7 +85,9 @@ class Coll {
     for (const [k, v] of Object.entries(u.$inc || {})) set(doc, k, (get(doc, k) || 0) + v);
     for (const [k, v] of Object.entries(u.$set || {})) set(doc, k, v);
     for (const k of Object.keys(u.$unset || {})) { const ks = k.split("."); const o = get(doc, ks.slice(0, -1).join(".")) ?? (ks.length === 1 ? doc : undefined); if (o) delete o[ks.at(-1)]; }
-    for (const [k, v] of Object.entries(u.$push || {})) set(doc, k, [...(get(doc, k) || []), v]);
+    for (const [k, v] of Object.entries(u.$push || {})) set(doc, k, [...(get(doc, k) || []), ...(v?.$each ?? [v])]);
+    for (const [k, v] of Object.entries(u.$max || {})) if (get(doc, k) == null || get(doc, k) < v) set(doc, k, v);
+    for (const [k, v] of Object.entries(u.$min || {})) if (get(doc, k) == null || get(doc, k) > v) set(doc, k, v);
     if (inserting) for (const [k, v] of Object.entries(u.$setOnInsert || {})) set(doc, k, v);
   }
   async upsertOrUpdate(f, u, opts = {}) {
@@ -247,8 +253,8 @@ const inChat = (chat, from, content) =>
   bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1, chat, from, ...content}});
 const command = text => ({text, entities: [{type: "bot_command", offset: 0, length: text.split(" ")[0].length}]});
 
-// Command menus: English by default and Russian; private chats list /start
-// and /help, groups the chat commands (with /lang) and /help.
+// Command menus: English by default and Russian; private chats list /start,
+// /help and /notify, groups the chat commands (with /lang) and /help.
 assert.deepEqual(commandMenus.map(menu => `${menu.language_code ?? "en"}:${menu.scope.type}`),
   ["en:default", "en:all_private_chats", "en:all_group_chats", "ru:default", "ru:all_private_chats", "ru:all_group_chats"]);
 const menu = (lang, type) => commandMenus.find(m => (m.language_code ?? "en") === lang && m.scope.type === type).commands;
@@ -257,7 +263,7 @@ assert.deepEqual(menu("en", "default").slice(0, 3), [
   {command: "jetton", description: "Set the reward jetton for this chat (creators)"},
   {command: "reward", description: "Grant points to a member (admins)"},
 ]);
-assert.deepEqual(menu("en", "all_private_chats").map(c => c.command), ["start", "help"]);
+assert.deepEqual(menu("en", "all_private_chats").map(c => c.command), ["start", "help", "notify"]);
 assert.deepEqual(menu("en", "all_group_chats").map(c => c.command), ["verify", "jetton", "reward", "lang", "help"]);
 assert.deepEqual(menu("ru", "all_group_chats").map(c => c.command), ["verify", "jetton", "reward", "lang", "help"]);
 assert.match(menu("ru", "default")[0].description, /создатель/);
@@ -301,7 +307,7 @@ assert.equal((await database.collection("chats").findOne({id: MIXED.id}))?.lang,
 const ADMIN = 15;
 statuses.set(ADMIN, "administrator");
 await inChat(MIXED, speaker(ADMIN, "en"), command("/lang de"));
-assert.equal(lastText(MIXED.id), `I don't speak "de" yet. Available: /lang ru or /lang en`);
+assert.equal(lastText(MIXED.id), `I don't speak "de" yet. Available: /lang ru, /lang en or /lang auto`);
 await inChat(MIXED, speaker(ADMIN, "en"), command("/lang RU"));
 assert.equal(lastText(MIXED.id), "Язык чата: русский. Теперь я пишу здесь по-русски.");
 assert.equal((await database.collection("chats").findOne({id: MIXED.id})).lang, "ru");
@@ -311,12 +317,25 @@ assert.match(lastText(MIXED.id), /^Поздравляем, U16!/);
 await inChat(MIXED, speaker(ADMIN, "en"), command("/reward 5"));
 assert.match(lastText(MIXED.id), /^В этом чате ещё не задан жетон/);
 await inChat(MIXED, speaker(12, "en"), command("/lang"));
-assert.equal(lastText(MIXED.id), "Язык чата: русский.\nИзменить (создатель и администраторы): /lang ru или /lang en");
+assert.equal(lastText(MIXED.id),
+  "Язык чата: русский.\nИзменить (создатель и администраторы): /lang ru, /lang en или /lang auto — по языку приложения каждого участника");
 await inChat(MIXED, speaker(ADMIN, "ru"), command("/lang en"));
 assert.equal(lastText(MIXED.id), "Chat language set: English. I will write here in English.");
 await inChat(MIXED, speaker(17, "ru"), {sticker: {file_id: "s"}});
 await settle();
 assert.match(lastText(MIXED.id), /New achievement unlocked/);
+// /lang auto (admins only) removes the language: replies follow whoever
+// triggered them again, the confirmation included.
+await inChat(MIXED, speaker(11, "ru"), command("/lang auto"));
+assert.equal(lastText(MIXED.id), "Only the chat creator and admins can change the chat language (I must be an admin to check).");
+await inChat(MIXED, speaker(ADMIN, "ru"), command("/lang AUTO"));
+assert.equal(lastText(MIXED.id), "Язык чата сброшен: я отвечаю каждому на языке его приложения Telegram.");
+assert.equal((await database.collection("chats").findOne({id: MIXED.id})).lang, undefined);
+await inChat(MIXED, speaker(18, "ru"), {sticker: {file_id: "s"}});
+await settle();
+assert.match(lastText(MIXED.id), /^Поздравляем, U18!/);
+await inChat(MIXED, speaker(12, "en"), command("/lang"));
+assert.equal(lastText(MIXED.id), `${t("en", "langNotSet")}\n${t("en", "langUsage")}`);
 
 // A reward confirmation in a Russian group, with Russian plurals.
 statuses.set(CREATOR, "creator");
@@ -324,6 +343,12 @@ await send(user(CREATOR), command("/lang ru"));
 const meme = await send(user(AUTHOR), {text: "meme"});
 await send(user(CREATOR), {...command("/reward 5 мем"), reply_to_message: {message_id: meme, date: 1, chat: CHAT, from: user(AUTHOR), text: "meme"}});
 assert.equal(lastText(CHAT.id), "U3: +5 баллов — мем\nИх можно будет забрать жетонами в мини-приложении, когда пройдёт срок созревания.");
+// grants are dated in epoch ms, reactions with a Date (what the mini app's lot
+// valuation and maturation expect)
+assert.ok(cols.get("grants").docs.length > 0);
+assert.ok(cols.get("grants").docs.every(d => Number.isSafeInteger(d.date)));
+assert.ok(cols.get("reaction_points").docs.length > 0);
+assert.ok(cols.get("reaction_points").docs.every(d => d.date instanceof Date));
 assert.deepEqual([1, 2, 5, 11, 21, 22, 112].map(n => t("ru", "rewardGranted", n, "X").split("\n")[0]),
   ["X: +1 балл", "X: +2 балла", "X: +5 баллов", "X: +11 баллов", "X: +21 балл", "X: +22 балла", "X: +112 баллов"]);
 assert.equal(t("en", "rewardGranted", 5, "U3", null),
@@ -355,6 +380,20 @@ await send(user(CREATOR), command("/reward @MemeLord 2"));
 assert.equal(points(63), 2);
 assert.equal(points(61), 7);
 assert.equal((await database.collection("users").findOne({id: 61})).username, null);
+// A member without a username is mentioned by name: a text_mention entity
+// that carries the user. The name may have spaces; only a mention in the
+// target's place picks the target.
+const IVAN = {id: 64, is_bot: false, first_name: "Ivan", last_name: "Petrov"};
+const mentionCommand = (text, name, user) => ({text, entities: [
+  {type: "bot_command", offset: 0, length: text.split(" ")[0].length},
+  {type: "text_mention", offset: text.indexOf(name), length: name.length, user},
+]});
+await send(user(CREATOR), mentionCommand("/reward Ivan Petrov 4 мем", "Ivan Petrov", IVAN));
+assert.equal(lastText(CHAT.id), "Ivan: +4 балла — мем\nИх можно будет забрать жетонами в мини-приложении, когда пройдёт срок созревания.");
+assert.equal(points(IVAN.id), 4);
+await send(user(CREATOR), mentionCommand("/reward 3 за Ivan Petrov", "Ivan Petrov", IVAN));
+assert.match(lastText(CHAT.id), /^Начислить баллы участнику:/);
+assert.equal(points(IVAN.id), 4);
 statuses.delete(CREATOR);
 
 // Private chats follow the user's Telegram app.
@@ -483,8 +522,16 @@ await postInChannel("/reward 5");
 assert.equal(lastText(CHANNEL.id),
   "I cannot see who sent this (anonymous admin or a post on behalf of the channel).\n" +
   "Post as yourself, or run the command in the linked discussion group.");
+// Only the channel's admins post in it: a channel post may set the language,
+// yet it still cannot /reward (the grant must name who gave it).
 await postInChannel("/lang ru");
-assert.equal(lastText(CHANNEL.id), t("en", "cannotSeeSender"));
+assert.equal(lastText(CHANNEL.id), "Язык чата: русский. Теперь я пишу здесь по-русски.");
+assert.equal((await database.collection("chats").findOne({id: CHANNEL.id})).lang, "ru");
+await postInChannel("/reward 5");
+assert.equal(lastText(CHANNEL.id), t("ru", "cannotSeeSender"));
+await postInChannel("/lang auto");
+assert.equal(lastText(CHANNEL.id), "Chat language reset: I reply in the language of each member's Telegram app.");
+assert.equal((await database.collection("chats").findOne({id: CHANNEL.id})).lang, undefined);
 await postInChannel("/jetton");
 assert.equal(lastText(CHANNEL.id), "I cannot see who sent this (a post on behalf of the channel). Post as yourself to run /jetton.");
 
@@ -516,10 +563,15 @@ assert.equal(first.sent + second.sent, 2);
 assert.deepEqual(textsTo(PRICE_RU.id), [
   "Цена балла снизится 5 октября 2026, 12:00 UTC: 1 балл = 0,5 → 0,25 MEME.\n" +
     "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.\n" +
-    "Чтобы получать личные напоминания, запустите @achivator_bot в личных сообщениях.",
+    "Нажмите «Получать напоминания», чтобы получить напоминание в личных сообщениях.",
   "Запланированное снижение цены балла отменено: 1 балл по-прежнему стоит 0,5 MEME.",
 ]);
-assert.deepEqual(buttons(sent.find(m => m.chat_id === PRICE_RU.id)), ["Открыть приложение https://t.me/achivator_bot/app"]);
+// a deep link to start the bot in private, which turns reminders on
+assert.deepEqual(buttons(sent.find(m => m.chat_id === PRICE_RU.id)), [
+  "Открыть приложение https://t.me/achivator_bot/app",
+  "🔔 Получать напоминания https://t.me/achivator_bot?start=remind",
+]);
+assert.equal(sent.filter(m => m.chat_id === PRICE_RU.id)[1].reply_markup, undefined, "only under a scheduled decrease");
 assert.equal(row(scheduled).sent_at.getTime(), NOW.getTime());
 assert.equal(row(cancelled).sent_at.getTime(), NOW.getTime());
 await run();
@@ -534,7 +586,7 @@ assert.deepEqual(textsTo(PRICE_EN.id), [
   "The price of a point has gone up: 1 point = 1 jetton (was 0.25).\nThe planned decrease is cancelled.",
   "The price of a point will drop on 5 Oct 2026, 12:00 UTC: 1 point = 1 → 0.5 USDT.\n" +
     "Points already earned can be claimed at the current price until then — open the mini app.\n" +
-    "Start @achivator_bot in private to get personal reminders.",
+    "Tap “Get reminders” to be reminded in private.",
 ]);
 assert.equal(t("en", "priceIncreased", {from: "1", to: "2", symbol: "X", cancelled_pending: false}),
   "The price of a point has gone up: 1 point = 2 X (was 1).");
@@ -599,7 +651,7 @@ assert.deepEqual(textsTo(-808), ["Цена балла снизилась: 1 ба
 const REQUESTED = new Date("2026-09-28T12:00:00Z");
 const pending = (price, extra = {}) => ({price, to_default: false, from: "0.5", symbol: "MEME",
   effective_at: EFFECTIVE, requested_at: REQUESTED, by: CREATOR, ...extra});
-await chatsColl.updateOne({id: PRICE_RU.id}, {$set: {point_price_pending: pending("0.25")}});
+await chatsColl.updateOne({id: PRICE_RU.id}, {$set: {point_price_pending: pending("0.25", {maturation_days: 4})}});
 await run(new Date(EFFECTIVE.getTime() - 1));
 const priceRu = () => cols.get("chats").docs.find(d => d.id === PRICE_RU.id);
 assert.equal(priceRu().point_price, "0.5", "not before effective_at");
@@ -609,19 +661,41 @@ const applied = await Promise.all([run(after), run(after)]);
 assert.equal(applied[0].applied + applied[1].applied, 1);
 assert.equal(priceRu().point_price, "0.25");
 assert.equal(priceRu().point_price_pending, undefined);
-assert.deepEqual(priceRu().point_price_history, [{old: "0.5", new: "0.25", at: EFFECTIVE, by: CREATOR}]);
+// the maturation snapshotted in the pending is carried into the history entry
+assert.deepEqual(priceRu().point_price_history,
+  [{old: "0.5", new: "0.25", at: EFFECTIVE, by: CREATOR, maturation_days: 4, from_default: false}]);
 assert.deepEqual(textsTo(PRICE_RU.id).slice(2), ["Цена балла снизилась: 1 балл = 0,25 MEME (было 0,5)."]);
+// through the outbox, and still in the pass that applied it
+assert.deepEqual(
+  cols.get("announcements").docs.filter(d => d.chat_id === PRICE_RU.id && d.type === "price_decreased")
+    .map(d => [d.params, d.sent_at.getTime(), d.message_id]),
+  [[{from: "0.5", to: "0.25", symbol: "MEME"}, after.getTime(), 1]]);
 await run(minutes(60 * 24 * 10));
 assert.equal(textsTo(PRICE_RU.id).length, 3);
 
-// Back to the platform default: point_price is removed; English chat.
+// Back to the platform default (0.01, JETTONS_PER_POINT's fallback while the
+// mini app has stored none): point_price is removed; English chat.
 await chatsColl.insertOne({id: PRICE_EN.id, point_price: "1",
-  point_price_pending: pending("0.1", {to_default: true, from: "1", symbol: null})});
+  point_price_pending: pending("0.01", {to_default: true, from: "1", symbol: null})});
 await run(after);
 const priceEn = cols.get("chats").docs.find(d => d.id === PRICE_EN.id);
 assert.ok(!("point_price" in priceEn) && !("point_price_pending" in priceEn));
-assert.deepEqual(priceEn.point_price_history, [{old: "1", new: "0.1", at: EFFECTIVE, by: CREATOR}]);
-assert.equal(textsTo(PRICE_EN.id).at(-1), "The price of a point has dropped: 1 point = 0.1 jetton (was 1).");
+// a pending scheduled before snapshots: no maturation_days (the mini app falls
+// back to the chat's current setting)
+assert.deepEqual(priceEn.point_price_history, [{old: "1", new: "0.01", at: EFFECTIVE, by: CREATOR, from_default: false}]);
+assert.equal(textsTo(PRICE_EN.id).at(-1), "The price of a point has dropped: 1 point = 0.01 jetton (was 1).");
+// The default the mini app stores has moved below the price the decrease was
+// scheduled to: the chat keeps that price (what the mini app pays for it),
+// rather than dropping further unannounced (miniapp#12).
+const settingsColl = database.collection("settings");
+await settingsColl.insertOne({_id: "point_price_default", price: "0.008", history: []});
+await chatsColl.insertOne({id: -813, point_price: "1",
+  point_price_pending: pending("0.01", {to_default: true, from: "1", symbol: null})});
+await run(after);
+const kept813 = cols.get("chats").docs.find(d => d.id === -813);
+assert.equal(kept813.point_price, "0.01");
+assert.equal(kept813.point_price_history[0].new, "0.01");
+await settingsColl.findOneAndDelete({_id: "point_price_default"});
 
 // The mini app replaced the pending decrease after the bot read it: the one
 // read is not applied (the new one waits for its own effective_at).
@@ -631,7 +705,7 @@ const realFind = cols.get("chats").find;
 cols.get("chats").find = function (f) {
   const cursor = realFind.call(this, f);
   const replaced = cols.get("chats").docs.find(d => d.id === REPLACED);
-  replaced.point_price_pending = pending("0.4", {requested_at: minutes(0), effective_at: minutes(60 * 24 * 7)});
+  replaced.point_price_pending = pending("0.4", {requested_at: minutes(0), effective_at: minutes(60 * 24 * 7), by: undefined});
   return cursor;
 };
 const outcome = await run(after);
@@ -642,6 +716,39 @@ assert.equal(replaced.point_price, "0.5");
 assert.equal(replaced.point_price_pending.price, "0.4");
 assert.equal(replaced.point_price_history, undefined);
 assert.equal(textsTo(REPLACED).length, 0);
+// The mini app saved a decrease but could not queue its announcement
+// (miniapp#15): two minutes on, the pass queues the same row, keyed and dated
+// as the mini app writes it, and sends it; never twice, and never one the
+// mini app did queue (keyed, or from before keys existed).
+const LOST = -810, KEYED = -811, OLDROW = -812;
+const lostPending = requested_at => ({price: "0.25", to_default: false, from: "0.5", symbol: "MEME",
+  effective_at: minutes(60 * 24 * 7), requested_at}); // no `by`: no creator reach summary in the DM tests below
+await chatsColl.insertOne({id: LOST, point_price: "0.5", point_price_pending: lostPending(minutes(-1))});
+await chatsColl.insertOne({id: KEYED, point_price: "0.5", point_price_pending: lostPending(minutes(-5))});
+await chatsColl.insertOne({id: OLDROW, point_price: "0.5", point_price_pending: lostPending(minutes(-5))});
+await queue(KEYED, "price_decrease_scheduled", {from: "0.5", to: "0.25", symbol: "MEME", effective_at: minutes(60 * 24 * 7)},
+  {key: `${KEYED}:price_decrease_scheduled:${minutes(-5).getTime()}`, created_at: minutes(-5)});
+await queue(OLDROW, "price_decrease_scheduled", {from: "0.5", to: "0.25", symbol: "MEME", effective_at: minutes(60 * 24 * 7)},
+  {created_at: minutes(-5)});
+await run();
+assert.equal(textsTo(LOST).length, 0, "the mini app's own write may still be on its way");
+await run(minutes(1));
+const lostRows = () => cols.get("announcements").docs.filter(d => d.chat_id === LOST);
+assert.deepEqual(lostRows().map(d => [d.key, d.type, d.params, d.created_at, d.sent_at]), [[
+  `${LOST}:price_decrease_scheduled:${minutes(-1).getTime()}`, "price_decrease_scheduled",
+  {from: "0.5", to: "0.25", symbol: "MEME", effective_at: minutes(60 * 24 * 7)}, minutes(-1), minutes(1)]]);
+assert.equal(textsTo(LOST).length, 1);
+assert.match(textsTo(LOST)[0], /^The price of a point will drop on 8 Oct 2026, 09:00 UTC: 1 point = 0\.5 → 0\.25 MEME\./);
+await run(minutes(2));
+assert.equal(lostRows().length, 1);
+assert.equal(cols.get("announcements").docs.filter(d => d.chat_id === KEYED || d.chat_id === OLDROW).length, 2);
+assert.equal(textsTo(KEYED).length + textsTo(OLDROW).length, 2);
+// a cancelled or applied decrease is not announced late
+await chatsColl.updateOne({id: LOST}, {$unset: {point_price_pending: ""}});
+await outbox.updateOne({key: lostRows()[0].key}, {$unset: {key: ""}, $set: {params: {}}});
+await run(minutes(3));
+assert.equal(lostRows().length, 1);
+
 // The timer runs a pass at once and stops cleanly.
 const queuedBefore = sent.length;
 await queue(-809, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"});
@@ -667,8 +774,10 @@ const dmRows = source_id => dmQueue.docs.filter(d => String(d.source_id) === Str
 const holdersOf = source_id => dmRows(source_id).map(d => d.user_id).sort((a, b) => a - b);
 const giveReward = (chat_id, user_id, pts, claimed_points) =>
   rewardsColl.insertOne({chat_id, user_id, points: pts, ...(claimed_points === undefined ? {} : {claimed_points})});
-const pendingDecrease = (from, price, effective_at) =>
-  ({price, to_default: false, from, symbol: "MEME", effective_at, requested_at: minutes(-5), by: CREATOR});
+// no `by` unless given: the creator who scheduled a decrease gets a summary
+// of its reminders (tested on its own below), which would show up here
+const pendingDecrease = (from, price, effective_at, extra = {}) =>
+  ({price, to_default: false, from, symbol: "MEME", effective_at, requested_at: minutes(-5), ...extra});
 const secondsLater = n => new Date(NOW.getTime() + n * 1000);
 
 // Exact decimal arithmetic for the estimate.
@@ -711,7 +820,7 @@ await run();
 assert.equal(textsTo(REMIND.id).at(-1),
   "Цена балла снизится 8 октября 2026, 12:00 UTC: 1 балл = 0,1 → 0,05 MEME.\n" +
   "До этого момента уже заработанные баллы можно забрать по текущей цене — откройте мини-приложение.\n" +
-  "Чтобы получать личные напоминания, запустите @achivator_bot в личных сообщениях.");
+  "Нажмите «Получать напоминания», чтобы получить напоминание в личных сообщениях.");
 assert.deepEqual(holdersOf(reminder), [1001, 1003, 1006]);
 assert.ok(row(reminder).fanned_out_at && !("fanout_due" in row(reminder)));
 const reminderRow = id => dmRows(reminder).find(d => d.user_id === id);
@@ -728,24 +837,31 @@ assert.equal(dmRows(reminder).length, 3);
 assert.ok(!("fanout_due" in row(reminder)));
 
 // Delivered with a button to the mini app, spaced 1/DM_RATE_PER_SEC apart.
+// The first private message a member ever gets says how to turn them off.
 assert.deepEqual(bot.dms.limits, {ratePerSec: 20, intervalMs: 1000, budget: 20});
 assert.deepEqual(await runDms(NOW), {sent: 3, skipped: 0, failed: 0, paused: false});
 assert.deepEqual(dmsTo(1001).map(m => m.text), [
   "В чате «Meme Lords» цена балла снизится 8 октября 2026, 12:00 UTC: 1 балл = 0,1 → 0,05 MEME.\n" +
-  "У вас 3 балла (≈ 0,3 MEME по текущей цене). Заберите их до этого времени, чтобы сохранить текущий курс."]);
+  "Сейчас можно забрать 3 балла (≈ 0,3 MEME по текущей цене): заберите их до этого времени, чтобы сохранить текущий курс.\n\n" +
+  "Вы получаете такие напоминания, потому что у вас есть баллы в этом чате. Чтобы отключить их, отправьте /notify off."]);
 assert.deepEqual(dmsTo(1006).map(m => m.text), [
   "In Meme Lords, the price of a point drops on 8 Oct 2026, 12:00 UTC: 1 point = 0.1 → 0.05 MEME.\n" +
-  "You have 2 points (≈ 0.2 MEME at the current price). Claim them before then to keep the current rate."]);
+  "You have 2 points to claim now (≈ 0.2 MEME at the current price): claim them before then to keep the current rate.\n\n" +
+  "You get these reminders because you have points in this chat. To stop them, send /notify off."]);
+assert.equal((await usersColl.findOne({id: 1006})).first_dm_at.getTime(), NOW.getTime());
+assert.equal((await usersColl.findOne({id: 1003})).first_dm_at.getTime(), NOW.getTime(), "recorded for a member never seen");
 assert.deepEqual(buttons(dmsTo(1006)[0]), ["Open the app https://t.me/achivator_bot/app"]);
 assert.deepEqual(buttons(dmsTo(1001)[0]), ["Открыть приложение https://t.me/achivator_bot/app"]);
 assert.equal(dmsTo(1003).length, 1);
 assert.equal(dmsTo(1002).length + dmsTo(1004).length + dmsTo(1005).length + dmsTo(1007).length, 0);
 assert.ok(dmRows(reminder).every(d => d.sent_at && !d.skipped));
+// reach, on the announcement: 1005 blocked the bot and was left out
+assert.deepEqual(row(reminder).reach, {queued: 3, sent: 3, unreachable: 1, opted_out: 0, failed: 0});
 assert.deepEqual(await runDms(secondsLater(1)), {sent: 0, skipped: 0, failed: 0, paused: false}, "sent once");
 assert.equal(t("en", "dmPriceDecreaseScheduled", {chat_title: null, from: "1", to: "0.5", symbol: null,
   effective_at: REMIND_AT, points: "1", estimate: "1"}),
   "In one of your chats, the price of a point drops on 8 Oct 2026, 12:00 UTC: 1 point = 1 → 0.5 jetton.\n" +
-  "You have 1 point (≈ 1 jetton at the current price). Claim them before then to keep the current rate.");
+  "You have 1 point to claim now (≈ 1 jetton at the current price): claim them before then to keep the current rate.");
 
 // The process dies between the chat message and queuing the private ones:
 // the next pass queues them, and the chat's later announcements wait.
@@ -812,6 +928,7 @@ await run(minutes(8));
 assert.deepEqual(await runDms(minutes(8)), {sent: 1, skipped: 2, failed: 0, paused: false});
 assert.deepEqual(dmRows(block1).map(d => [d.user_id, d.skipped ?? null]), [[3003, "unreachable"], [3004, "unreachable"], [3005, null]]);
 assert.match(dmRows(block1)[0].last_error, /blocked by the user/);
+assert.deepEqual(row(block1).reach, {queued: 3, sent: 1, unreachable: 2, opted_out: 0, failed: 0});
 assert.ok((await usersColl.findOne({id: 3003})).dm_blocked_at);
 assert.ok((await usersColl.findOne({id: 3004})).dm_blocked_at);
 dmFailures.delete(3003);
@@ -883,7 +1000,8 @@ assert.deepEqual(holdersOf(cancelRow), [4001], "idempotent");
 await runDms(minutes(34));
 assert.deepEqual(dmsTo(4001).map(m => m.text), [
   "In Cancel Club, the price of a point drops on 8 Oct 2026, 12:00 UTC: 1 point = 0.5 → 0.25 MEME.\n" +
-  "You have 2 points (≈ 1 MEME at the current price). Claim them before then to keep the current rate.",
+  "You have 2 points to claim now (≈ 1 MEME at the current price): claim them before then to keep the current rate.\n\n" +
+  "You get these reminders because you have points in this chat. To stop them, send /notify off.",
   "In Cancel Club, the planned price drop is cancelled; 1 point stays 0.5 MEME."]);
 assert.deepEqual([4002, 4003, 4004].map(id => dmsTo(id).length), [0, 0, 0]);
 assert.equal(t("ru", "dmPriceDecreaseCancelled", {chat_title: "Клуб", from: "0.5", symbol: null}),
@@ -913,12 +1031,587 @@ assert.equal(sendAttempts.filter(id => id === 5001 || id === 5002).length, 1);
 assert.equal((await runDms(new Date(minutes(40).getTime() + 8000))).sent, 2);
 assert.deepEqual([dmsTo(5001).length, dmsTo(5002).length], [1, 1]);
 
-// The DM timer starts once and stops cleanly.
+// A big chat: holders are streamed and queued 500 at a time (one users
+// lookup and one unordered insertMany per batch), duplicates tolerated.
+const HUGE = -908;
+await chatsColl.insertOne({id: HUGE, title: "Huge", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+const HUGE_HOLDERS = 1100;
+rewardsColl.docs.push(...Array.from({length: HUGE_HOLDERS}, (_, i) => ({_id: `huge-${i}`, chat_id: HUGE, user_id: 70000 + i, points: 2})));
+const {insertedId: huge} = await queue(HUGE, "price_decrease_scheduled", {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT},
+  {created_at: minutes(44)});
+// one of them is queued already (a crash halfway through an earlier run)
+await dmQueue.insertOne({user_id: 70500, chat_id: HUGE, source_id: huge, kind: "price_decrease_scheduled", params: {},
+  lang: "en", created_at: minutes(44), send_after: minutes(44), sent_at: null, claimed_at: null, attempts: 0, last_error: null});
+const insertSizes = [];
+const lookupSizes = [];
+const realInsertMany = dmQueue.insertMany;
+dmQueue.insertMany = function (docs, opts) { insertSizes.push(docs.length); return realInsertMany.call(this, docs, opts); };
+const realUsersFind = usersColl.find;
+usersColl.find = function (f) { if (f.id?.$in) lookupSizes.push(f.id.$in.length); return realUsersFind.call(this, f); };
+await run(minutes(45));
+dmQueue.insertMany = realInsertMany;
+usersColl.find = realUsersFind;
+assert.deepEqual(insertSizes, [500, 500, 100]);
+assert.deepEqual(lookupSizes, [500, 500, 100]);
+assert.equal(dmRows(huge).length, HUGE_HOLDERS, "every holder once, the one already queued included");
+assert.ok(row(huge).fanned_out_at);
+await dmQueue.updateMany({source_id: huge}, {$set: {sent_at: minutes(45), skipped: "test"}});
+
+// The DM loop: an idle queue waits twice as long after each empty pass, up to
+// 30 s; new rows wake it at once, even in the middle of a pass.
+const {createDmQueue} = await import("../dm-queue.mjs");
+const loopCols = new Map();
+const loopDb = {collection: name => (loopCols.has(name) ? loopCols.get(name) : loopCols.set(name, new Coll()).get(name))};
+const delays = [];
+let armed = null;
+const fakeTimers = {
+  setTimeout(fn, ms) { delays.push(ms); armed = {fn, cleared: false, unref() {}}; return armed; },
+  clearTimeout(handle) { handle.cleared = true; },
+};
+const loopSent = [];
+const loop = createDmQueue({database: loopDb, telegram: {sendMessage: async id => loopSent.push(id)},
+  render: () => ({text: "x", extra: {}}), timers: fakeTimers, env: {}});
+const passDone = () => new Promise(resolve => setTimeout(resolve, 60)); // a pass may wait its 50 ms slot
+const fire = async () => { const handle = armed; armed = null; assert.ok(!handle.cleared); handle.fn(); await passDone(); };
+const loopRow = user_id => ({user_id, chat_id: 1, source_id: `loop-${user_id}`, kind: "k", params: {}, lang: "en"});
+loop.start();
+await passDone();
+for (let i = 0; i < 5; i++) await fire();
+assert.deepEqual(delays, [2000, 4000, 8000, 16000, 30000, 30000], "idle: backs off to the 30 s cap");
+await loop.enqueue([loopRow(1)], new Date(Date.now() - 1000));
+const idleTimer = armed;
+loop.wake();
+assert.ok(idleTimer.cleared, "wake cancels the idle wait");
+assert.equal(delays.at(-1), 0, "and runs a pass at once");
+await fire();
+assert.deepEqual(loopSent, [1]);
+assert.equal(delays.at(-1), 1000, "after a busy pass: the normal interval");
+await fire();
+assert.equal(delays.at(-1), 2000);
+// woken during a pass (which may have read the queue already): another pass
+// right after it
+armed.fn();
+await loop.enqueue([loopRow(2)], new Date(Date.now() - 1000));
+loop.wake();
+await passDone();
+assert.equal(delays.at(-1), 0);
+await fire();
+assert.deepEqual(loopSent, [1, 2]);
+const scheduledBeforeStop = delays.length;
+loop.stop();
+assert.ok(armed.cleared, "stop cancels the next pass");
+loop.wake();
+assert.ok(armed.cleared && delays.length === scheduledBeforeStop, "a stopped loop is not woken");
+
+// The bot's loop starts once and stops cleanly, and a fan-out wakes it. Every
+// pass reads the shared pause first (it may stop there: the loop runs on the
+// real clock).
+const stateColl = cols.get("bot_state");
+const realStateFind = stateColl.findOne;
+let pauseReads = 0;
+stateColl.findOne = function (f) { pauseReads++; return realStateFind.call(this, f); };
 bot.dms.start(60 * 60 * 1000);
 bot.dms.start(60 * 60 * 1000);
 await settle();
+assert.equal(pauseReads, 1, "one pass at start");
+await settle();
+assert.equal(pauseReads, 1, "then the long wait");
+const WAKE = -909;
+await chatsColl.insertOne({id: WAKE, title: "Wake", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+await giveReward(WAKE, 7901, 1);
+const {insertedId: wakeRow} = await queue(WAKE, "price_decrease_scheduled", {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT},
+  {created_at: minutes(45)});
+await run(minutes(46));
+assert.equal(dmRows(wakeRow).length, 1);
+const readsAfterFanOut = pauseReads; // the announcements read it too
+await settle();
+assert.equal(pauseReads, readsAfterFanOut + 1, "the fan-out woke the private message loop");
 bot.dms.stop();
+stateColl.findOne = realStateFind;
+await dmQueue.updateMany({source_id: wakeRow}, {$set: {sent_at: minutes(46), skipped: "test"}});
+
+// ---- What a reminder says ----
+// The split mirrors the mini app's lot pricing (pure: reminders.mjs).
+const R = await import("../reminders.mjs");
+const DAYS = n => n * R.DAY_MS;
+assert.equal(R.defaultMaturationDays({}), 3);
+assert.equal(R.defaultMaturationDays({MATURATION_DAYS: "7"}), 7);
+assert.equal(R.defaultMaturationDays({MATURATION_DAYS: "31"}), 3, "out of range: the default");
+assert.equal(R.chatMaturationDays({claim_settings: {maturation_days: 5}}, {}), 5);
+assert.equal(R.chatMaturationDays({claim_settings: {maturation_days: 0}}, {}), 0);
+assert.equal(R.chatMaturationDays({}, {MATURATION_DAYS: "2"}), 2);
+assert.equal(R.chatMaturationDays({claim_settings: {maturation_days: 5, claim_days: [9]}}, {}), 3,
+  "settings that do not validate fall back as a whole, like claimSettingsOf()");
+assert.equal(R.decreaseMaturationDays({maturation_days: 10}, {claim_settings: {maturation_days: 3}}, {}), 10, "the pending's snapshot");
+assert.equal(R.decreaseMaturationDays({maturation_days: 0}, {claim_settings: {maturation_days: 3}}, {}), 0, "a 0 snapshot counts");
+assert.equal(R.decreaseMaturationDays({}, {claim_settings: {maturation_days: 4}}, {}), 4, "no snapshot: the chat's setting");
+assert.equal(R.decreaseMaturationDays({maturation_days: "5"}, null, {MATURATION_DAYS: "6"}), 6, "nor a valid one: the default");
+{
+  const now = new Date("2026-10-01T00:00:00Z");
+  const effectiveAt = new Date(now.getTime() + DAYS(7.1));
+  const timing = {now, effectiveAt, maturationDays: 3, decreaseDays: 10};
+  assert.equal(R.lotWindowStart(timing), now.getTime() - DAYS(3));
+  // earned 1 day ago (a Date), 2.95 days ago (epoch ms), exactly at the cutoff
+  // (claimable: the mini app's `date <= now - maturation`), 5 days ago, and
+  // lots the mini app ignores
+  const lots = [
+    {points: 4, at: new Date(now.getTime() - DAYS(1))},
+    {points: 3, at: now.getTime() - DAYS(2.95)},
+    {points: 7, at: now.getTime() - DAYS(3)},
+    {points: 5, at: new Date(now.getTime() - DAYS(5))},
+    {points: 2.5, at: now.getTime()},
+    {points: 1, at: "yesterday"},
+  ];
+  assert.deepEqual(R.maturingPoints(lots, timing), {maturingNow: 7, maturingAtDecrease: 4});
+  assert.deepEqual(R.maturingPoints(lots, {...timing, decreaseDays: 3}), {maturingNow: 7, maturingAtDecrease: 0},
+    "maturation shorter than the notice: nothing is protected");
+  assert.deepEqual(R.maturingPoints(lots, {...timing, maturationDays: 0, decreaseDays: 0}), {maturingNow: 0, maturingAtDecrease: 0});
+  assert.deepEqual(R.maturingPoints(undefined, timing), {maturingNow: 0, maturingAtDecrease: 0});
+}
+assert.deepEqual(R.splitUnclaimed({unclaimed: "18", maturingNow: 8, maturingAtDecrease: 5}),
+  {claimable: "10", maturing: "3", protected: "5", atRisk: "13"});
+assert.deepEqual(R.splitUnclaimed({unclaimed: "3"}), {claimable: "3", maturing: "0", protected: "0", atRisk: "3"}, "nothing maturing");
+assert.deepEqual(R.splitUnclaimed({unclaimed: "4", maturingNow: 4, maturingAtDecrease: 4}),
+  {claimable: "0", maturing: "0", protected: "4", atRisk: "0"}, "all protected: no reminder");
+assert.deepEqual(R.splitUnclaimed({unclaimed: "4", maturingNow: 4, maturingAtDecrease: 0}),
+  {claimable: "0", maturing: "4", protected: "0", atRisk: "4"}, "none claimable yet, but all before the drop");
+assert.deepEqual(R.splitUnclaimed({unclaimed: "10", maturingNow: 1, maturingAtDecrease: 4}),
+  {claimable: "6", maturing: "0", protected: "4", atRisk: "6"}, "a snapshot longer than the setting");
+assert.deepEqual(R.splitUnclaimed({unclaimed: "3", maturingNow: 9, maturingAtDecrease: 2}),
+  {claimable: "0", maturing: "1", protected: "2", atRisk: "1"}, "lots ahead of the total are cut");
+assert.deepEqual(R.splitUnclaimed({unclaimed: "2.5", maturingNow: 1, maturingAtDecrease: 1}),
+  {claimable: "1.5", maturing: "0", protected: "1", atRisk: "1.5"});
+assert.equal(R.splitUnclaimed({unclaimed: null}), null);
+
+// In a chat, from the bot's own collections: the pending's maturation
+// snapshot (10 days, longer than the 7 days' notice) decides what is
+// protected, the chat's claim setting (3 days) what is claimable now.
+const T0 = minutes(47);
+const reactionColl = database.collection("reaction_points");
+const grantsColl = database.collection("grants");
+const ago = n => new Date(T0.getTime() - DAYS(n));
+const MATURE = {id: -910, type: "supergroup", title: "Mature"};
+const CHAT_CREATOR = 8100;
+await chatsColl.insertOne({id: MATURE.id, title: "Mature", point_price: "1", claim_settings: {maturation_days: 3},
+  point_price_pending: pendingDecrease("1", "0.5", REMIND_AT, {maturation_days: 10, by: CHAT_CREATOR})});
+await giveReward(MATURE.id, 8001, 20, 2);
+await reactionColl.insertOne({chat_id: MATURE.id, receiver_id: 8001, message_id: 1, reactor_id: 1, emoji: "👍", points: 4, date: ago(1)});
+await reactionColl.insertOne({chat_id: MATURE.id, receiver_id: 8001, message_id: 2, reactor_id: 1, emoji: "👍", points: 1, date: ago(0.5).getTime()});
+await grantsColl.insertOne({chat_id: MATURE.id, user_id: 8001, points: 3, date: ago(2.95).getTime()});
+await reactionColl.insertOne({chat_id: MATURE.id, receiver_id: 8001, message_id: 3, reactor_id: 1, emoji: "👍", points: 5, date: ago(10)});
+await giveReward(MATURE.id, 8002, 4); // all still maturing at the drop
+await reactionColl.insertOne({chat_id: MATURE.id, receiver_id: 8002, message_id: 4, reactor_id: 1, emoji: "👍", points: 4, date: ago(1)});
+await giveReward(MATURE.id, 8003, 2);
+await reactionColl.insertOne({chat_id: -911, receiver_id: 8003, message_id: 5, reactor_id: 1, emoji: "👍", points: 2, date: ago(1)});
+await giveReward(MATURE.id, 8004, 3); // turned reminders off
+await giveReward(MATURE.id, 8005, 3); // turns them off once queued
+// /notify works in private only, and /notify off is remembered
+await inChat(MATURE, speaker(8004, "en"), command("/notify off"));
+assert.equal(lastText(MATURE.id), "Send /notify to me in a private chat: it turns your price drop reminders on or off.");
+assert.equal((await usersColl.findOne({id: 8004})).notify_off_at, undefined);
+await inChat(DM(8004), speaker(8004, "en"), command("/notify off"));
+assert.equal(lastText(8004), "Reminders are off: I won't write to you before the price of your points drops. To turn them back on: /notify on");
+assert.ok((await usersColl.findOne({id: 8004})).notify_off_at);
+await inChat(DM(8004), speaker(8004, "ru"), command("/notify"));
+assert.equal(lastText(8004), "Напоминания о снижении цены отключены. Включить: /notify on");
+
+const {insertedId: mature} = await queue(MATURE.id, "price_decrease_scheduled",
+  {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT}, {created_at: minutes(46)});
+await run(T0);
+assert.deepEqual(holdersOf(mature), [8001, 8003, 8005], "opted out and nothing to lose: no reminder");
+assert.deepEqual(dmRows(mature).find(d => d.user_id === 8001).params,
+  {chat_title: "Mature", from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT,
+    points: "10", estimate: "10", maturing: "3", maturing_estimate: "3", protected: "5"});
+assert.deepEqual(row(mature).reach, {queued: 3, sent: 0, unreachable: 0, opted_out: 1, failed: 0});
+assert.equal(row(mature).scheduled_by, CHAT_CREATOR);
+assert.equal(row(mature).reach_due, true);
+await inChat(DM(8005), speaker(8005, "en"), command("/notify off"));
+await run(T0);
+assert.ok(!dmRows(`reach:${mature}`).length, "no summary while reminders are still to send");
+await runDms(T0);
+assert.deepEqual(dmsTo(8001).map(m => m.text), [
+  "In Mature, the price of a point drops on 8 Oct 2026, 12:00 UTC: 1 point = 1 → 0.5 MEME.\n" +
+  "You have 10 points to claim now (≈ 10 MEME at the current price): claim them before then to keep the current rate.\n" +
+  "3 more points mature before then (≈ 3 MEME): claim them as soon as they do.\n" +
+  "5 points still maturing at the drop keep the current price anyway.\n\n" +
+  "You get these reminders because you have points in this chat. To stop them, send /notify off."]);
+assert.equal(dmsTo(8003).length, 1);
+assert.equal(dmsTo(8005).filter(m => m.text.startsWith("In Mature")).length, 0);
+assert.equal(dmRows(mature).find(d => d.user_id === 8005).skipped, "notify off");
+assert.deepEqual(row(mature).reach, {queued: 3, sent: 2, unreachable: 0, opted_out: 2, failed: 0});
+// all done: the creator who scheduled it hears the reach, once
+await run(minutes(48));
+assert.ok(row(mature).reach_reported_at && !("reach_due" in row(mature)));
+await run(minutes(48.5));
+assert.equal(dmRows(`reach:${mature}`).length, 1);
+await runDms(minutes(48));
+assert.deepEqual(dmsTo(CHAT_CREATOR).map(m => m.text), [
+  "Reminders about the price drop in Mature on 8 Oct 2026, 12:00 UTC: 2 sent, 0 unreachable " +
+  "(never started the bot or blocked it), 2 turned off."]);
+assert.equal(t("ru", "dmReachSummary", {chat_title: "Мемы", effective_at: REMIND_AT, sent: 5, unreachable: 1, opted_out: 0, failed: 2}),
+  "Напоминания о снижении цены в чате «Мемы» 8 октября 2026, 12:00 UTC: отправлено 5, не доставлено 1 " +
+  "(бот не запущен или заблокирован), отключили 0, ошибок 2.");
+// /start from the announcement's "Get reminders" turns them back on
+await inChat(DM(8004), speaker(8004, "en"), command("/start remind"));
+assert.equal(lastText(8004),
+  "Reminders are on: I'll write to you here before the price of your points drops in your chats. To stop them: /notify off");
+assert.equal((await usersColl.findOne({id: 8004})).notify_off_at, undefined);
+await inChat(DM(8004), speaker(8004, "en"), command("/notify"));
+assert.equal(lastText(8004), "Price drop reminders are on. To turn them off: /notify off");
+await inChat(DM(8005), speaker(8005, "en"), command("/notify on"));
+assert.equal((await usersColl.findOne({id: 8005})).notify_off_at, undefined);
+
+// A pending without a snapshot: the chat's setting (3 days) protects nothing
+// a week ahead. The hint is only in a member's first private message.
+const FALLBACK = -911;
+await chatsColl.insertOne({id: FALLBACK, title: "Fallback", lang: "ru", point_price: "1", claim_settings: {maturation_days: 3},
+  point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+await giveReward(FALLBACK, 8001, 2);
+await giveReward(FALLBACK, 8003, 2); // the lot above, still maturing, not protected
+const {insertedId: fallback} = await queue(FALLBACK, "price_decrease_scheduled",
+  {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT}, {created_at: minutes(48)});
+await run(minutes(48));
+await runDms(minutes(48));
+assert.deepEqual(dmRows(fallback).map(d => [d.user_id, d.params.points, d.params.maturing, d.params.protected]),
+  [[8001, "2", "0", "0"], [8003, "0", "2", "0"]]);
+assert.equal(dmsTo(8003).at(-1).text,
+  "В чате «Fallback» цена балла снизится 8 октября 2026, 12:00 UTC: 1 балл = 1 → 0,5 MEME.\n" +
+  "2 балла созреют до этого времени (≈ 2 MEME): заберите их, как только они станут доступны.");
+assert.equal(t("en", "dmPriceDecreaseScheduled", {...dmRows(fallback)[1].params, chat_title: "Fallback"}),
+  "In Fallback, the price of a point drops on 8 Oct 2026, 12:00 UTC: 1 point = 1 → 0.5 MEME.\n" +
+  "2 points mature before then (≈ 2 MEME): claim them as soon as they do.");
+assert.equal(t("ru", "dmPriceDecreaseScheduled", {...dmRows(mature)[0].params, chat_title: "Мемы"}),
+  "В чате «Мемы» цена балла снизится 8 октября 2026, 12:00 UTC: 1 балл = 1 → 0,5 MEME.\n" +
+  "Сейчас можно забрать 10 баллов (≈ 10 MEME по текущей цене): заберите их до этого времени, чтобы сохранить текущий курс.\n" +
+  "Ещё 3 балла созреют до этого времени (≈ 3 MEME): заберите их, как только они станут доступны.\n" +
+  "Баллы, которые ещё будут созревать в момент снижения (5), в любом случае сохранят текущую цену.");
+assert.ok(!dmsTo(8001).at(-1).text.includes("/notify"), "the hint is in the first message only");
+
+// An increase that cancels the decrease tells those reminded (and nobody
+// gets a new reminder); one that cancels nothing tells nobody in private.
+await chatsColl.updateOne({id: FALLBACK}, {$set: {point_price: "2"}, $unset: {point_price_pending: ""}});
+const {insertedId: raised} = await queue(FALLBACK, "price_increased", {from: "1", to: "2", symbol: "MEME", cancelled_pending: true},
+  {created_at: minutes(48.5)});
+const {insertedId: raisedAgain} = await queue(FALLBACK, "price_increased", {from: "2", to: "3", symbol: "MEME", cancelled_pending: false},
+  {created_at: minutes(48.6)});
+await run(minutes(48.7));
+assert.deepEqual(holdersOf(raised), [8001, 8003]);
+assert.equal(row(raisedAgain).fanned_out_at, undefined);
+await runDms(minutes(48.7));
+assert.equal(dmsTo(8003).at(-1).text,
+  "В чате «Fallback» запланированное снижение цены балла отменено: цена выросла, 1 балл = 2 MEME (было 1).");
+assert.equal(t("en", "dmPriceIncreaseCancelsDecrease", {chat_title: "Fallback", from: "1", to: "2", symbol: null}),
+  "In Fallback, the planned price drop is cancelled: the price of a point has gone up, 1 point = 2 jetton (was 1).");
+
+// ---- Delivery failures ----
+// A 403 is final: no retries, and the chat is flagged for the mini app until
+// the bot is added back or a post goes through.
+const KICKED = {id: -950, type: "supergroup", title: "Kicked"};
+const chatDoc = id => chatsColl.docs.find(d => d.id === id);
+await chatsColl.insertOne({id: KICKED.id, title: "Kicked"});
+dmFailures.set(KICKED.id, tgError(403, "Forbidden: bot was kicked from the supergroup chat"));
+const {insertedId: kicked} = await queue(KICKED.id, "price_increased", {from: "1", to: "2", symbol: "X", cancelled_pending: false},
+  {created_at: minutes(49)});
+await run(minutes(50));
+await run(minutes(51));
+assert.equal(sendAttempts.filter(id => id === KICKED.id).length, 1, "no retry after a 403");
+assert.deepEqual([row(kicked).attempts, row(kicked).sent_at], [5, null]);
+assert.equal(chatDoc(KICKED.id).bot_cannot_post_at.getTime(), minutes(50).getTime());
+assert.equal(chatDoc(KICKED.id).bot_cannot_post_reason, "Forbidden: bot was kicked from the supergroup chat");
+dmFailures.delete(KICKED.id);
+await botStatus(KICKED, speaker(31, "en"), "administrator");
+assert.ok(!("bot_cannot_post_at" in chatDoc(KICKED.id)), "added back");
+await botStatus(KICKED, speaker(31, "en"), "kicked");
+assert.match(chatDoc(KICKED.id).bot_cannot_post_reason, /banned/);
+await queue(KICKED.id, "price_decrease_cancelled", {from: "2", to: "1", symbol: "X"}, {created_at: minutes(51)});
+await run(minutes(52));
+assert.equal(textsTo(KICKED.id).at(-1), "The planned price decrease is cancelled: 1 point stays 2 X.");
+assert.ok(!("bot_cannot_post_at" in chatDoc(KICKED.id)) && !("bot_cannot_post_reason" in chatDoc(KICKED.id)),
+  "a post that goes through clears it");
+
+// The chat's message is given up, its members' reminders still go out, and
+// so does the cancellation to those reminded.
+const MUTED = {id: -951, title: "Muted"};
+await chatsColl.insertOne({id: MUTED.id, title: "Muted", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+await giveReward(MUTED.id, 6101, 4);
+dmFailures.set(MUTED.id, tgError(400, "Bad Request: not enough rights to send text messages to the chat"));
+const {insertedId: muted} = await queue(MUTED.id, "price_decrease_scheduled",
+  {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT}, {created_at: minutes(52)});
+await run(minutes(53));
+assert.deepEqual([row(muted).attempts, row(muted).sent_at, sendAttempts.filter(id => id === MUTED.id).length], [5, null, 1]);
+assert.ok(row(muted).fanned_out_at && chatDoc(MUTED.id).bot_cannot_post_at);
+assert.deepEqual(holdersOf(muted), [6101]);
+await runDms(minutes(53));
+assert.match(dmsTo(6101).at(-1).text, /^In Muted, the price of a point drops on 8 Oct 2026/);
+await chatsColl.updateOne({id: MUTED.id}, {$unset: {point_price_pending: ""}});
+const {insertedId: mutedCancel} = await queue(MUTED.id, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "MEME"},
+  {created_at: minutes(54)});
+await run(minutes(55));
+assert.equal(row(mutedCancel).sent_at, null);
+assert.deepEqual(holdersOf(mutedCancel), [6101]);
+await runDms(minutes(55));
+assert.equal(dmsTo(6101).at(-1).text, "In Muted, the planned price drop is cancelled; 1 point stays 1 MEME.");
+dmFailures.delete(MUTED.id);
+
+// A group that became a supergroup: the send to the old id fails with
+// migrate_to_chat_id, the move is recorded and the announcement goes to the
+// new id. Everything economic stays under the old id (its TON pool is
+// derived from it), and the new chat's own document is not overwritten.
+const OLD = -952, NEW = -100952;
+const JETTON = "EQ" + "c".repeat(46);
+await chatsColl.insertOne({id: OLD, title: "Old", lang: "ru", jetton_master: JETTON, creator: CREATOR, point_price: "1"});
+await chatsColl.insertOne({id: NEW, title: "New", lang: "en"});
+await giveReward(OLD, 6201, 3);
+const rewardsIn = chat_id => rewardsColl.docs.filter(d => d.chat_id === chat_id).map(d => [d.user_id, d.points]);
+dmFailures.set(OLD, tgError(400, "Bad Request: group chat was upgraded to a supergroup chat", {migrate_to_chat_id: NEW}));
+const {insertedId: movedRow} = await queue(OLD, "price_increased", {from: "1", to: "2", symbol: "X", cancelled_pending: false},
+  {created_at: minutes(55)});
+await run(minutes(56));
+assert.deepEqual(textsTo(NEW), ["Цена балла выросла: 1 балл = 2 X (было 1)."], "in the chat's language");
+assert.deepEqual([row(movedRow).chat_id, row(movedRow).posted_chat_id, row(movedRow).sent_at.getTime(), row(movedRow).attempts],
+  [OLD, NEW, minutes(56).getTime(), 0]);
+const withoutId = doc => Object.fromEntries(Object.entries(doc).filter(([k]) => k !== "_id"));
+const migratedChats = () => ({oldDoc: withoutId(chatDoc(OLD)), newDoc: withoutId(chatDoc(NEW))});
+assert.deepEqual(migratedChats(), {
+  oldDoc: {id: OLD, title: "Old", lang: "ru", jetton_master: JETTON, creator: CREATOR, point_price: "1",
+    migrated_to_chat_id: NEW, migrated_at: minutes(56), migration_needs_review: true},
+  newDoc: {id: NEW, title: "New", lang: "en", migrated_from_chat_id: OLD},
+});
+assert.deepEqual([rewardsIn(OLD), rewardsIn(NEW)], [[[6201, 3]], []], "points stay with the pool's chat id");
+const migrationLog = `chat ${OLD} migrated to ${NEW}; economic data and the TON pool stay keyed by ${OLD}`;
+assert.equal(errors.filter(line => line.includes(migrationLog)).length, 1);
+// the supergroup's service message records it again: nothing changes
+const snapshot = JSON.stringify(migratedChats());
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
+  chat: {id: NEW, type: "supergroup", title: "New"}, from: user(CREATOR), migrate_from_chat_id: OLD}});
+assert.equal(JSON.stringify(migratedChats()), snapshot);
+assert.equal(chatsColl.docs.filter(d => d.id === NEW).length, 1);
+assert.equal(errors.filter(line => line.includes(migrationLog)).length, 1, "logged once");
+// later announcements for the old id go straight to the new one
+await queue(OLD, "price_decrease_cancelled", {from: "2", to: "1", symbol: "X"}, {created_at: minutes(56)});
+await run(minutes(56.5));
+assert.equal(textsTo(NEW).length, 2);
+assert.equal(sendAttempts.filter(id => id === OLD).length, 1);
+dmFailures.delete(OLD);
+
+// The old group's service message: nothing is sent to the old id, the new
+// chat gets a minimal document, and a decrease announced for the old id
+// still reminds its members, whose points stay there.
+const OLD2 = -953, NEW2 = -100953;
+await chatsColl.insertOne({id: OLD2, title: "Old2", jetton_master: JETTON, point_price: "1",
+  point_price_pending: pendingDecrease("1", "0.5", REMIND_AT)});
+await giveReward(OLD2, 6301, 2);
+await bot.handleUpdate({update_id: ++updateId, message: {message_id: ++msgId, date: 1,
+  chat: {id: OLD2, type: "group", title: "Old2"}, from: user(CREATOR), migrate_to_chat_id: NEW2}});
+assert.deepEqual(withoutId(chatDoc(NEW2)), {id: NEW2, migrated_from_chat_id: OLD2});
+assert.equal(chatDoc(OLD2).point_price_pending.price, "0.5");
+assert.equal(chatDoc(OLD2).migration_needs_review, true);
+const {insertedId: oldScheduled} = await queue(OLD2, "price_decrease_scheduled",
+  {from: "1", to: "0.5", symbol: "MEME", effective_at: REMIND_AT}, {created_at: minutes(57)});
+await run(minutes(57));
+assert.equal(textsTo(NEW2).length, 1);
+assert.equal(sendAttempts.filter(id => id === OLD2).length, 0);
+assert.deepEqual([row(oldScheduled).chat_id, row(oldScheduled).posted_chat_id], [OLD2, NEW2]);
+assert.deepEqual(holdersOf(oldScheduled), [6301]);
+await runDms(minutes(57));
+assert.match(dmsTo(6301).at(-1).text, /^In Old2, the price of a point drops on 8 Oct 2026/);
+
+// The bot's own "price decreased" goes through the outbox: a failed send is
+// retried on the next pass.
+const DROP = -954;
+await chatsColl.insertOne({id: DROP, title: "Drop", point_price: "1", point_price_pending: pendingDecrease("1", "0.5", minutes(57))});
+await giveReward(DROP, 6401, 3);
+dmFailures.set(DROP, tgError(502, "Bad Gateway"));
+assert.equal((await run(minutes(58))).applied, 1);
+const dropRow = () => cols.get("announcements").docs.find(d => d.chat_id === DROP);
+assert.deepEqual([dropRow().type, dropRow().attempts, dropRow().sent_at], ["price_decreased", 1, null]);
+dmFailures.delete(DROP);
+await run(minutes(59));
+assert.deepEqual(textsTo(DROP), ["The price of a point has dropped: 1 point = 0.5 MEME (was 1)."]);
+// a decrease applied with no notice (here: one the bot applies) reminds
+// nobody in private: there is nothing left to act on
+assert.equal(dmQueue.docs.filter(d => d.chat_id === DROP).length, 0);
+
+// A 429 pauses every process: the pause is stored, and a second bot (a
+// rolling deploy) honours it, for private messages and announcements alike.
+const bot2 = createBot(database, "1:x");
+const noSleep = {sleep: async () => {}};
+await insertDm(5003, minutes(60));
+dmFailures.set(5003, tgError(429, "Too Many Requests: retry after 30", {retry_after: 30}));
+assert.equal((await runDms(minutes(60))).paused, true);
+dmFailures.delete(5003);
+const pauseDoc = cols.get("bot_state").docs.find(d => d._id === "telegram_pause");
+assert.ok(pauseDoc.pause_until.getTime() >= minutes(60).getTime() + 30 * 1000);
+const midPause = new Date(minutes(60).getTime() + 10 * 1000);
+assert.equal((await bot2.dms.run(midPause, noSleep)).paused, true, "the other process waits too");
+const {insertedId: waiting} = await queue(-955, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"},
+  {created_at: minutes(60)});
+await bot2.announcements.run(midPause);
+assert.equal(row(waiting).sent_at, null, "announcements wait too");
+await bot2.announcements.run(minutes(61));
+assert.ok(row(waiting).sent_at);
+assert.equal((await bot2.dms.run(minutes(61), noSleep)).sent, 1);
+// a 429 on an announcement pauses too, and is not a failed attempt
+dmFailures.set(-956, tgError(429, "Too Many Requests: retry after 20", {retry_after: 20}));
+const {insertedId: limitedRow} = await queue(-956, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"},
+  {created_at: minutes(62)});
+await run(minutes(62));
+assert.deepEqual([row(limitedRow).attempts, row(limitedRow).sent_at, row(limitedRow).claimed_at], [0, null, null]);
+dmFailures.delete(-956);
+assert.equal((await bot2.dms.run(new Date(minutes(62).getTime() + 10 * 1000), noSleep)).paused, true);
+await bot2.announcements.run(new Date(minutes(62).getTime() + 10 * 1000));
+assert.equal(row(limitedRow).sent_at, null);
+await run(minutes(63));
+assert.equal(textsTo(-956).length, 1);
 console.error = originalError;
+
+// ---- Switching the reward jetton (issue #7) ----
+// A switch to another jetton drops the custom price (the platform default
+// pays), cancels a decrease still ahead, records the reset in the history
+// (protecting no lot: maturation_days 0), asks the mini app for a new price
+// and announces it through the outbox. The same jetton, however spelled,
+// changes nothing else.
+const OLD_JETTON = "EQ" + "c".repeat(46), NEW_JETTON = "EQ" + "d".repeat(46);
+const rawAddress = friendly => {
+  const bytes = Buffer.from(friendly, "base64url");
+  return `${bytes.readInt8(1)}:${bytes.subarray(2, 34).toString("hex")}`;
+};
+const SWITCH = {id: -960, type: "supergroup", title: "Switch"}, SWITCH_OWNER = 9001;
+statuses.set(SWITCH_OWNER, "creator");
+const DAY_MS = 24 * 60 * 60 * 1000;
+const aheadAt = new Date(Date.now() + 5 * DAY_MS), requestedAt = new Date(Date.now() - DAY_MS);
+const earlier = {old: "1", new: "0.5", at: new Date(Date.now() - 30 * DAY_MS), by: SWITCH_OWNER, maturation_days: 3};
+await chatsColl.insertOne({id: SWITCH.id, jetton_master: OLD_JETTON, creator: SWITCH_OWNER, point_price: "0.5",
+  point_price_pending: {price: "0.25", to_default: false, from: "0.5", symbol: "OLDT", effective_at: aheadAt,
+    requested_at: requestedAt, by: SWITCH_OWNER, maturation_days: 3},
+  point_price_history: [earlier]});
+const switchChat = () => chatsColl.docs.find(d => d.id === SWITCH.id);
+const switchRows = () => outbox.docs.filter(d => d.chat_id === SWITCH.id);
+
+await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${NEW_JETTON}`));
+assert.equal(switchChat().jetton_master, NEW_JETTON);
+assert.equal(switchChat().point_price, undefined, "the custom price is dropped");
+assert.equal(switchChat().point_price_pending, undefined, "the decrease ahead is cancelled");
+const [kept, resetEntry] = switchChat().point_price_history;
+assert.deepEqual(kept, earlier);
+assert.ok(resetEntry.at instanceof Date);
+assert.deepEqual({...resetEntry, at: null}, {old: "0.5", new: "0.01", at: null, by: SWITCH_OWNER, maturation_days: 0,
+  reason: "jetton_changed", old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, from_default: false});
+const confirm = switchChat().point_price_confirm_required;
+assert.deepEqual({...confirm, at: null},
+  {reason: "jetton_changed", at: null, by: SWITCH_OWNER, old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, old_price: "0.5"});
+assert.equal(switchRows().length, 1);
+assert.deepEqual({...switchRows()[0], _id: null, created_at: null}, {_id: null, chat_id: SWITCH.id, type: "jetton_changed",
+  params: {old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, old_symbol: "OLDT", new_symbol: null, old_price: "0.5",
+    price_reset: true, cancelled_pending: true},
+  created_at: null, sent_at: null, claimed_at: null, attempts: 0});
+assert.equal(lastText(SWITCH.id),
+  `Reward jetton changed: ${NEW_JETTON}\n(was ${OLD_JETTON})\n\n` +
+  "The price of a point is reset to the platform default: the old price was in the old jetton. " +
+  "Set a price in the new jetton in the mini app.\nThe planned price decrease is cancelled.\n\n" +
+  "Unclaimed points are now paid in the new jetton: top up the pool with it. " +
+  "The old jetton left in the pool stays there; only the pool admin can withdraw it.");
+// the scheduler sends it to the chat, with a button to the mini app
+// (after the 429 pause the delivery tests above left behind)
+await run(minutes(64));
+assert.equal(switchRows()[0].sent_at.getTime(), minutes(64).getTime());
+assert.equal(lastText(SWITCH.id),
+  "The reward jetton of this chat has changed.\n" +
+  `Was: OLDT (${OLD_JETTON})\nNow: ${NEW_JETTON}\n\n` +
+  "The price of a point (was 0.5 OLDT) is reset to the platform default until the creator sets a new one in the mini app." +
+  "\nThe planned price decrease is cancelled.\nUnclaimed points are now paid in the new jetton.");
+assert.deepEqual(buttons(lastMessage(SWITCH.id)), ["Open the app https://t.me/achivator_bot/app"]);
+
+// The same jetton again, in its raw spelling: nothing is reset or announced.
+await chatsColl.updateOne({id: SWITCH.id}, {$set: {point_price: "0.2"}});
+await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${rawAddress(NEW_JETTON)}`));
+assert.match(lastText(SWITCH.id), /^Reward jetton set: /);
+assert.equal(switchChat().point_price, "0.2");
+assert.equal(switchChat().point_price_history.length, 2);
+assert.equal(switchRows().length, 1);
+assert.deepEqual(switchChat().point_price_confirm_required, confirm);
+
+// A decrease already due goes into the history before the reset; a chat
+// already on the default gets a reset entry at the same price (the switch
+// still ends the old jetton's decreases for the mini app). The default comes
+// from JETTONS_PER_POINT until the mini app has stored one.
+process.env.JETTONS_PER_POINT = "0.10";
+const dueAt = new Date(Date.now() - DAY_MS);
+await chatsColl.updateOne({id: SWITCH.id}, {$set: {point_price_pending: {price: "0.15", to_default: false, from: "0.2",
+  symbol: null, effective_at: dueAt, requested_at: requestedAt, by: SWITCH_OWNER, maturation_days: 2}}});
+await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${OLD_JETTON}`));
+assert.deepEqual(switchChat().point_price_history.slice(2).map(h => ({...h, at: h.at.getTime()})), [
+  {old: "0.2", new: "0.15", at: dueAt.getTime(), by: SWITCH_OWNER, maturation_days: 2, from_default: false},
+  {old: "0.15", new: "0.1", at: switchChat().point_price_confirm_required.at.getTime(), by: SWITCH_OWNER,
+    maturation_days: 0, reason: "jetton_changed", old_jetton: rawAddress(NEW_JETTON), new_jetton: OLD_JETTON,
+    from_default: false},
+]);
+assert.equal(switchRows().at(-1).params.cancelled_pending, false);
+assert.equal(switchChat().point_price_pending, undefined);
+
+const SWITCH_RU = {id: -961, type: "supergroup", title: "Смена"};
+await chatsColl.insertOne({id: SWITCH_RU.id, jetton_master: OLD_JETTON, creator: SWITCH_OWNER, lang: "ru"});
+await inChat(SWITCH_RU, speaker(SWITCH_OWNER, "ru"), command(`/jetton ${NEW_JETTON}`));
+const ruChat = chatsColl.docs.find(d => d.id === SWITCH_RU.id);
+assert.deepEqual(ruChat.point_price_history.map(h => ({...h, at: null})), [{old: "0.1", new: "0.1", at: null, by: SWITCH_OWNER,
+  maturation_days: 0, reason: "jetton_changed", old_jetton: OLD_JETTON, new_jetton: NEW_JETTON, from_default: true}],
+  "no price of its own: the switch is recorded at the same price");
+assert.equal(ruChat.point_price_confirm_required.old_price, "0.1");
+assert.equal(lastText(SWITCH_RU.id),
+  `Жетон для наград изменён: ${NEW_JETTON}\n(был ${OLD_JETTON})\n\n` +
+  "Цена балла — стандартная цена платформы. Задайте цену в новом жетоне в мини-приложении.\n\n" +
+  "Незабранные баллы теперь выплачиваются новым жетоном — пополните им пул. " +
+  "Остаток старого жетона остаётся в пуле; вывести его может только администратор пула.");
+await run(minutes(64));
+assert.equal(lastText(SWITCH_RU.id),
+  "Жетон для наград в этом чате изменён.\n" +
+  `Был: ${OLD_JETTON}\nТеперь: ${NEW_JETTON}\n\n` +
+  "Цена балла остаётся стандартной ценой платформы, пока создатель не задаст свою в мини-приложении." +
+  "\nНезабранные баллы теперь выплачиваются новым жетоном.");
+// Once the mini app stores the default, that is the one (miniapp#12).
+await settingsColl.insertOne({_id: "point_price_default", price: "0.2", history: []});
+await chatsColl.updateOne({id: SWITCH.id}, {$set: {point_price: "0.5"}});
+await inChat(SWITCH, speaker(SWITCH_OWNER, "en"), command(`/jetton ${NEW_JETTON}`));
+assert.deepEqual([switchChat().point_price_history.at(-1).new, switchChat().point_price_confirm_required.old_price], ["0.2", "0.5"]);
+await settingsColl.findOneAndDelete({_id: "point_price_default"});
+delete process.env.JETTONS_PER_POINT;
+statuses.delete(SWITCH_OWNER);
+
+// ---- The platform default's decreases (miniapp#12) ----
+// The operator lowered JETTONS_PER_POINT and the mini app scheduled it with
+// notice: every chat on the default (with a jetton) hears it ahead, once, and
+// again once it is in effect; chats with their own price do not.
+const PLAT_A = -970, PLAT_B = -971, PLAT_OWN = -972, PLAT_NONE = -973;
+await chatsColl.insertOne({id: PLAT_A, jetton_master: OLD_JETTON});
+await chatsColl.insertOne({id: PLAT_B, jetton_master: OLD_JETTON, lang: "ru"});
+await chatsColl.insertOne({id: PLAT_OWN, jetton_master: OLD_JETTON, point_price: "0.02"});
+await chatsColl.insertOne({id: PLAT_NONE});
+const platRequested = minutes(100), platEffective = minutes(100 + 60 * 24 * 7);
+await settingsColl.insertOne({_id: "point_price_default", price: "0.01", history: [],
+  pending: {price: "0.005", from: "0.01", effective_at: platEffective, requested_at: platRequested}});
+const platRows = chat_id => outbox.docs.filter(d => d.chat_id === chat_id && d.platform !== undefined);
+await run(minutes(101));
+assert.deepEqual(platRows(PLAT_A).map(d => [d.key, d.type, d.params, d.platform, d.created_at]), [[
+  `${PLAT_A}:price_decrease_scheduled:platform:${platRequested.getTime()}`, "price_decrease_scheduled",
+  {from: "0.01", to: "0.005", symbol: null, effective_at: platEffective}, platRequested.getTime(), platRequested]]);
+assert.match(textsTo(PLAT_A).at(-1), /^The price of a point will drop on 8 Oct 2026, 10:40 UTC: 1 point = 0\.01 → 0\.005 jetton\./);
+assert.match(textsTo(PLAT_B).at(-1), /^Цена балла снизится 8 октября 2026, 10:40 UTC: 1 балл = 0,01 → 0,005 жетона\./);
+assert.equal(platRows(PLAT_OWN).length + platRows(PLAT_NONE).length, 0);
+await run(minutes(102));
+assert.equal(platRows(PLAT_A).length, 1, "once");
+// in effect (written out by the mini app or not): "dropped", once
+const platAfter = new Date(platEffective.getTime() + 60 * 1000);
+await run(platAfter);
+await run(new Date(platAfter.getTime() + 60 * 1000));
+assert.deepEqual(platRows(PLAT_A).map(d => d.type), ["price_decrease_scheduled", "price_decreased"]);
+assert.equal(textsTo(PLAT_A).at(-1), "The price of a point has dropped: 1 point = 0.005 jetton (was 0.01).");
+// and only for a while after it
+await settingsColl.updateOne({_id: "point_price_default"}, {$set: {price: "0.005",
+  history: [{old: "0.01", new: "0.005", at: platEffective, requested_at: platRequested}]}, $unset: {pending: ""}});
+await chatsColl.insertOne({id: -974, jetton_master: OLD_JETTON});
+await run(new Date(platEffective.getTime() + 3 * DAY_MS));
+assert.equal(platRows(-974).length, 0);
+await settingsColl.findOneAndDelete({_id: "point_price_default"});
 
 // A missing key falls back to English, an unknown key does not throw.
 assert.equal(t("de", "jettonWhere"), "Run this command in a group or channel.");
@@ -1046,6 +1739,21 @@ statuses.delete(SUB_HEIR);
 // Off again: every chat accrues, as before subscriptions existed.
 delete process.env.SUBSCRIPTIONS_ENABLED;
 Telegram.prototype.callApi = plainCallApi;
+
+// ---- Startup environment ----
+// Production needs the database, the token and the webhook domain; without
+// Grafana it starts with a warning. Development needs nothing.
+const {checkEnv} = await import("../env.mjs");
+const PROD = {NODE_ENV: "production", MONGODB_URI: "mongodb://db", ACHIVATOR_TOKEN: "1:x", WEBHOOK_URL: "bot.example.com"};
+assert.deepEqual(checkEnv(PROD),
+  {missing: [], warnings: ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_USER_ID, ACHIVATOR_GRAFANA_TOKEN"]});
+assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}), {missing: [], warnings: []});
+assert.deepEqual(checkEnv({...PROD, ACHIVATOR_GRAFANA_USER_ID: "1"}).warnings,
+  ["Metrics disabled, missing ENV var: ACHIVATOR_GRAFANA_TOKEN"]);
+assert.deepEqual(checkEnv({NODE_ENV: "production", ACHIVATOR_GRAFANA_USER_ID: "1", ACHIVATOR_GRAFANA_TOKEN: "t"}).missing,
+  ["MONGODB_URI", "ACHIVATOR_TOKEN", "WEBHOOK_URL"]);
+assert.deepEqual(checkEnv({...PROD, WEBHOOK_URL: ""}).missing, ["WEBHOOK_URL"]);
+assert.deepEqual(checkEnv({NODE_ENV: "development"}), {missing: [], warnings: []});
 
 console.log = originalLog;
 console.log("ALL OK");
