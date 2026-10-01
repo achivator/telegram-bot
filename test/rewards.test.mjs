@@ -705,7 +705,7 @@ const realFind = cols.get("chats").find;
 cols.get("chats").find = function (f) {
   const cursor = realFind.call(this, f);
   const replaced = cols.get("chats").docs.find(d => d.id === REPLACED);
-  replaced.point_price_pending = pending("0.4", {requested_at: minutes(0), effective_at: minutes(60 * 24 * 7)});
+  replaced.point_price_pending = pending("0.4", {requested_at: minutes(0), effective_at: minutes(60 * 24 * 7), by: undefined});
   return cursor;
 };
 const outcome = await run(after);
@@ -722,7 +722,7 @@ assert.equal(textsTo(REPLACED).length, 0);
 // mini app did queue (keyed, or from before keys existed).
 const LOST = -810, KEYED = -811, OLDROW = -812;
 const lostPending = requested_at => ({price: "0.25", to_default: false, from: "0.5", symbol: "MEME",
-  effective_at: minutes(60 * 24 * 7), requested_at, by: CREATOR});
+  effective_at: minutes(60 * 24 * 7), requested_at}); // no `by`: no creator reach summary in the DM tests below
 await chatsColl.insertOne({id: LOST, point_price: "0.5", point_price_pending: lostPending(minutes(-1))});
 await chatsColl.insertOne({id: KEYED, point_price: "0.5", point_price_pending: lostPending(minutes(-5))});
 await chatsColl.insertOne({id: OLDROW, point_price: "0.5", point_price_pending: lostPending(minutes(-5))});

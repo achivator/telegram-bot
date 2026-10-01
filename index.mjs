@@ -2258,9 +2258,11 @@ export default function createBot(database, token, options) {
       });
     }
     if (!expected.length) return 0;
-    const since = new Date(Math.min(...expected.map(row => row.created_at.getTime())));
+    // No created_at bound: a row queued before keys existed may be dated a
+    // moment before its decrease's requested_at, and missing it would announce
+    // the decrease twice.
     const queued = await announcements
-      .find({chat_id: {$in: expected.map(row => row.chat_id)}, type: "price_decrease_scheduled", created_at: {$gte: since}})
+      .find({chat_id: {$in: expected.map(row => row.chat_id)}, type: "price_decrease_scheduled"})
       .toArray();
     let added = 0;
     for (const row of expected) {
