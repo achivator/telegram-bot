@@ -702,6 +702,39 @@ assert.equal(replaced.point_price, "0.5");
 assert.equal(replaced.point_price_pending.price, "0.4");
 assert.equal(replaced.point_price_history, undefined);
 assert.equal(textsTo(REPLACED).length, 0);
+// The mini app saved a decrease but could not queue its announcement
+// (miniapp#15): two minutes on, the pass queues the same row, keyed and dated
+// as the mini app writes it, and sends it; never twice, and never one the
+// mini app did queue (keyed, or from before keys existed).
+const LOST = -810, KEYED = -811, OLDROW = -812;
+const lostPending = requested_at => ({price: "0.25", to_default: false, from: "0.5", symbol: "MEME",
+  effective_at: minutes(60 * 24 * 7), requested_at, by: CREATOR});
+await chatsColl.insertOne({id: LOST, point_price: "0.5", point_price_pending: lostPending(minutes(-1))});
+await chatsColl.insertOne({id: KEYED, point_price: "0.5", point_price_pending: lostPending(minutes(-5))});
+await chatsColl.insertOne({id: OLDROW, point_price: "0.5", point_price_pending: lostPending(minutes(-5))});
+await queue(KEYED, "price_decrease_scheduled", {from: "0.5", to: "0.25", symbol: "MEME", effective_at: minutes(60 * 24 * 7)},
+  {key: `${KEYED}:price_decrease_scheduled:${minutes(-5).getTime()}`, created_at: minutes(-5)});
+await queue(OLDROW, "price_decrease_scheduled", {from: "0.5", to: "0.25", symbol: "MEME", effective_at: minutes(60 * 24 * 7)},
+  {created_at: minutes(-5)});
+await run();
+assert.equal(textsTo(LOST).length, 0, "the mini app's own write may still be on its way");
+await run(minutes(1));
+const lostRows = () => cols.get("announcements").docs.filter(d => d.chat_id === LOST);
+assert.deepEqual(lostRows().map(d => [d.key, d.type, d.params, d.created_at, d.sent_at]), [[
+  `${LOST}:price_decrease_scheduled:${minutes(-1).getTime()}`, "price_decrease_scheduled",
+  {from: "0.5", to: "0.25", symbol: "MEME", effective_at: minutes(60 * 24 * 7)}, minutes(-1), minutes(1)]]);
+assert.equal(textsTo(LOST).length, 1);
+assert.match(textsTo(LOST)[0], /^The price of a point will drop on 8 Oct 2026, 09:00 UTC: 1 point = 0\.5 → 0\.25 MEME\./);
+await run(minutes(2));
+assert.equal(lostRows().length, 1);
+assert.equal(cols.get("announcements").docs.filter(d => d.chat_id === KEYED || d.chat_id === OLDROW).length, 2);
+assert.equal(textsTo(KEYED).length + textsTo(OLDROW).length, 2);
+// a cancelled or applied decrease is not announced late
+await chatsColl.updateOne({id: LOST}, {$unset: {point_price_pending: ""}});
+await outbox.updateOne({key: lostRows()[0].key}, {$unset: {key: ""}, $set: {params: {}}});
+await run(minutes(3));
+assert.equal(lostRows().length, 1);
+
 // The timer runs a pass at once and stops cleanly.
 const queuedBefore = sent.length;
 await queue(-809, "price_decrease_cancelled", {from: "1", to: "0.5", symbol: "X"});

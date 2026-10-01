@@ -1539,6 +1539,11 @@ export default function createBot(database, token, options) {
   // decrease's announcement
   announcements.createIndex({fanout_due: 1}, {sparse: true}).catch(console.error);
   announcements.createIndex({chat_id: 1, type: 1, created_at: 1}).catch(console.error);
+  // rows written more than once (a retry, queueMissedScheduled) are queued
+  // once; rows without a key (the bot's own, older ones) are not indexed
+  announcements
+    .createIndex({key: 1}, {unique: true, partialFilterExpression: {key: {$type: "string"}}})
+    .catch(console.error);
   chats.createIndex({"point_price_pending.effective_at": 1}, {sparse: true}).catch(console.error);
 
   // 400 errors that mean the bot cannot post in the chat, whatever the retry
@@ -2189,12 +2194,81 @@ export default function createBot(database, token, options) {
     return applied;
   }
 
+  // ---- Scheduled decreases whose announcement was never queued ----
+  // The mini app saves a decrease (point_price_pending) and then queues its
+  // "price_decrease_scheduled" row: two writes without a transaction
+  // (miniapp#15). If the second one fails, the row is queued here once the
+  // pending is RECONCILE_AFTER_MS old, exactly as the mini app writes it:
+  // keyed `<chat_id>:price_decrease_scheduled:<requested_at ms>` (unique
+  // index below, so neither ever queues it twice) and dated by requested_at,
+  // so it is sent in the chat's order. A row queued before keys existed is
+  // matched by its effective_at. The mini app also re-queues it on its next
+  // read of the chat. Batches walk the pending chats by _id across passes.
+  const RECONCILE_AFTER_MS = 2 * 60 * 1000;
+  let reconcileAfterId = null;
+  async function queueMissedScheduled(now) {
+    const filter = {
+      "point_price_pending.effective_at": {$gt: now},
+      "point_price_pending.requested_at": {$lte: new Date(now.getTime() - RECONCILE_AFTER_MS)},
+    };
+    if (reconcileAfterId !== null) filter._id = {$gt: reconcileAfterId};
+    const batch = await chats.find(filter).sort({_id: 1}).limit(ANNOUNCE_BATCH).toArray();
+    reconcileAfterId = batch.length < ANNOUNCE_BATCH ? null : batch.at(-1)._id;
+    const expected = [];
+    for (const chat of batch) {
+      const p = chat.point_price_pending;
+      const requested = p.requested_at instanceof Date ? p.requested_at : null;
+      const effective = p.effective_at instanceof Date ? p.effective_at : null;
+      // no notice: nothing was announced ahead (applyDueDecreases does it)
+      if (!requested || !effective || effective <= requested || !isPrice(p.price)) continue;
+      expected.push({
+        key: `${chat.id}:price_decrease_scheduled:${requested.getTime()}`,
+        chat_id: chat.id,
+        type: "price_decrease_scheduled",
+        params: {from: p.from, to: p.price, symbol: p.symbol ?? null, effective_at: effective},
+        created_at: requested,
+        sent_at: null,
+        claimed_at: null,
+        attempts: 0,
+      });
+    }
+    if (!expected.length) return 0;
+    const since = new Date(Math.min(...expected.map(row => row.created_at.getTime())));
+    const queued = await announcements
+      .find({chat_id: {$in: expected.map(row => row.chat_id)}, type: "price_decrease_scheduled", created_at: {$gte: since}})
+      .toArray();
+    let added = 0;
+    for (const row of expected) {
+      const known = queued.some(
+        q =>
+          q.key === row.key ||
+          (q.key == null && q.chat_id === row.chat_id && new Date(q.params?.effective_at).getTime() === row.params.effective_at.getTime()),
+      );
+      if (known) continue;
+      const {key, ...doc} = row;
+      try {
+        await announcements.updateOne({key}, {$setOnInsert: doc}, {upsert: true});
+      } catch (error) {
+        if (error?.code !== 11000) throw error; // the mini app queued it meanwhile
+        continue;
+      }
+      added++;
+      console.log(`chat ${row.chat_id}: queued the missing announcement of the decrease to ${row.params.to}`);
+    }
+    return added;
+  }
+
   // One pass: send queued announcements, then apply due decreases and send
   // what they queued. Never rejects; resolves to what it did, for logs and
   // tests.
   async function runAnnouncements(now = new Date()) {
     const done = {sent: 0, applied: 0, subscriptions: 0, reach: 0};
     const held = new Set();
+    try {
+      await queueMissedScheduled(now);
+    } catch (error) {
+      console.error("queuing missed price announcements failed:", error);
+    }
     try {
       done.sent = await drainOutbox(now, held);
     } catch (error) {
