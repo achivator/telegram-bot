@@ -22,6 +22,11 @@ import {performance} from "node:perf_hooks";
 // them out, until they /start the bot again (clearBlocked). Other failures
 // are retried with backoff and given up after DM_MAX_ATTEMPTS.
 //
+// Reminders are opt-out: a user who sent /notify off has
+// `users.notify_off_at`, and their reminder rows (`optional`) are skipped
+// until /notify on. The first message the queue sends a user says so; it is
+// recorded as `users.first_dm_at`.
+//
 // Rows are claimed atomically, like the announcements outbox, so overlapping
 // passes or processes never send one twice; a claim older than
 // DM_CLAIM_TIMEOUT_MS belongs to a pass that died and is taken over.
@@ -97,15 +102,25 @@ function positiveNumber(value, fallback) {
   return Number(value) > 0 ? Number(value) : fallback;
 }
 
-// `render(row)` -> {text, extra} or null (malformed: given up);
+// `render(row, {firstDm})` -> {text, extra, hinted} or null (malformed:
+// given up); `firstDm` is true while the user has never been sent a message
+// from this queue (users.first_dm_at), and `hinted: true` records that this
+// one told them how to opt out, which sets first_dm_at once it is sent.
 // `isStale(row, now, cache)` -> a reason to skip the row instead of sending,
 // or null; `cache` is a Map that lives for one pass.
+// `optional(row)`: whether the row is a reminder the user can turn off with
+// /notify off (users.notify_off_at); such rows are skipped, "notify off".
+// `onOutcome(row, outcome)` hears what became of a row before it is marked:
+// "sent", "unreachable", "opted_out" or "failed" (given up); a row dropped
+// as stale is not reported. Its failures are logged, never retried.
 // `pause` is createPause's, shared with whatever else sends.
 export function createDmQueue({
   database,
   telegram,
   render,
   isStale = async () => null,
+  optional = () => false,
+  onOutcome = async () => {},
   pause = createPause(database),
   env = process.env,
   timers = {setTimeout, clearTimeout},
@@ -165,6 +180,14 @@ export function createDmQueue({
     return inserted;
   }
 
+  async function report(row, outcome) {
+    try {
+      await onOutcome(row, outcome);
+    } catch (error) {
+      console.error(`dm ${row._id}: reporting ${outcome} failed:`, error);
+    }
+  }
+
   // The user cannot be written to until they start the bot again.
   function markBlocked(user_id, at = new Date()) {
     return users.updateOne({id: user_id}, {$set: {dm_blocked_at: at}}, {upsert: true});
@@ -195,9 +218,12 @@ export function createDmQueue({
       if (due.length === 0) return done;
 
       const ids = [...new Set(due.map(row => row.user_id))];
-      const blocked = new Set(
-        (await users.find({id: {$in: ids}, dm_blocked_at: {$ne: null}}).toArray()).map(doc => doc.id),
-      );
+      const known = await users
+        .find({id: {$in: ids}}, {projection: {id: 1, dm_blocked_at: 1, notify_off_at: 1, first_dm_at: 1}})
+        .toArray();
+      const blocked = new Set(known.filter(doc => doc.dm_blocked_at).map(doc => doc.id));
+      const optedOut = new Set(known.filter(doc => doc.notify_off_at).map(doc => doc.id));
+      const written = new Set(known.filter(doc => doc.first_dm_at).map(doc => doc.id));
       const cache = new Map();
 
       for (const queued of due) {
@@ -208,15 +234,22 @@ export function createDmQueue({
         if (!row) continue; // another pass took it
         const where = `dm ${row._id} (${row.kind}) to ${row.user_id}`;
         try {
-          const reason = blocked.has(row.user_id) ? "dm blocked" : await isStale(row, now, cache);
+          const reason = blocked.has(row.user_id)
+            ? "dm blocked"
+            : optedOut.has(row.user_id) && optional(row)
+            ? "notify off"
+            : await isStale(row, now, cache);
           if (reason) {
+            if (reason === "dm blocked") await report(row, "unreachable");
+            if (reason === "notify off") await report(row, "opted_out");
             await queue.updateOne({_id: row._id}, {$set: {sent_at: now, skipped: reason}});
             done.skipped++;
             continue;
           }
-          const message = render(row);
+          const message = render(row, {firstDm: !written.has(row.user_id)});
           if (!message) {
             console.error(`${where}: unknown kind or malformed params, giving up`, row.params);
+            await report(row, "failed");
             await queue.updateOne(
               {_id: row._id},
               {$set: {claimed_at: null, attempts: DM_MAX_ATTEMPTS, last_error: "unknown kind or malformed params"}},
@@ -246,6 +279,7 @@ export function createDmQueue({
             }
             if (outcome.kind === "unreachable") {
               console.log(`${where}: skipped, the user cannot be written to (${outcome.description})`);
+              await report(row, "unreachable");
               await queue.updateOne(
                 {_id: row._id},
                 {$set: {sent_at: now, skipped: "unreachable", last_error: outcome.description}},
@@ -258,6 +292,7 @@ export function createDmQueue({
             const attempts = outcome.kind === "rejected" ? DM_MAX_ATTEMPTS : (row.attempts || 0) + 1;
             const giveUp = attempts >= DM_MAX_ATTEMPTS;
             console.error(`${where}: attempt ${(row.attempts || 0) + 1} failed${giveUp ? ", giving up" : ""}:`, outcome.description);
+            if (giveUp) await report(row, "failed");
             await queue.updateOne(
               {_id: row._id},
               {
@@ -272,10 +307,17 @@ export function createDmQueue({
             done.failed++;
             continue;
           }
-          // if this write fails the claim expires and the user hears it
-          // twice, which beats never
+          // reported first: if marking the row fails, the claim expires and
+          // the user hears it (and it is counted) twice, which beats never
+          await report(row, "sent");
           await queue.updateOne({_id: row._id}, {$set: {sent_at: now}});
           done.sent++;
+          if (message.hinted) {
+            written.add(row.user_id);
+            await users
+              .updateOne({id: row.user_id}, {$min: {first_dm_at: now}}, {upsert: true})
+              .catch(error => console.error("recording first_dm_at failed:", error));
+          }
         } catch (error) {
           // the claim expires and a later pass retries
           console.error(`${where} failed:`, error);

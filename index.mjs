@@ -6,6 +6,13 @@ import {LANGUAGES, langFromCode, t} from "./i18n.mjs";
 import {classifyTelegramError, createDmQueue, createPause, DM_MAX_ATTEMPTS} from "./dm-queue.mjs";
 import {decimalMul, decimalSub, isPositiveDecimal} from "./decimal.mjs";
 import {parseSubscriptionPayload, serviceState, subscriptionConfig} from "./subscription.mjs";
+import {
+  chatMaturationDays,
+  decreaseMaturationDays,
+  lotWindowStart,
+  maturingPoints,
+  splitUnclaimed,
+} from "./reminders.mjs";
 
 dotenv.config();
 
@@ -828,7 +835,13 @@ export default function createBot(database, token, options) {
     if (ctx.chat?.type === "private") {
       // the user can be written to again (see the private messages queue)
       await dms.clearBlocked(ctx.from.id).catch(error => console.error("clearing dm_blocked_at failed:", error));
-      // a /start payload from a deep link carries nothing the bot acts on yet
+      // "Get reminders" under a price decrease announcement
+      if (ctx.command === "start" && ctx.payload === "remind") {
+        await setReminders(ctx.from.id, true);
+        await ctx.reply(t(lang, "remindersOn"));
+        return;
+      }
+      // any other /start payload carries nothing the bot acts on
       await ctx.reply(t(lang, "welcome"), {
         reply_markup: {
           inline_keyboard: [
@@ -853,9 +866,41 @@ export default function createBot(database, token, options) {
     await ctx.reply(t(lang, "startGroupSetup", t(lang, "setupGuideUrl")), noPreview);
   }
 
+  // ---- /notify ----
+  // Private price decrease reminders are on unless the member turns them off:
+  // /notify off sets users.notify_off_at (fan-outs leave them out, queued
+  // reminders are skipped), /notify on or /start remind removes it. Only in
+  // private: it is about the member, not the chat.
+  async function setReminders(user_id, on) {
+    if (on) await users.updateOne({id: user_id, notify_off_at: {$ne: null}}, {$unset: {notify_off_at: ""}});
+    else await users.updateOne({id: user_id}, {$set: {notify_off_at: new Date()}}, {upsert: true});
+  }
+
+  async function handleNotify(ctx) {
+    const lang = await ctx.state.lang();
+    if (ctx.chat?.type !== "private") {
+      await ctx.reply(t(lang, "notifyPrivate"));
+      return;
+    }
+    const arg = (ctx.payload || "").trim().split(/\s+/)[0].toLowerCase();
+    if (arg === "on" || arg === "off") {
+      await setReminders(ctx.from.id, arg === "on");
+      // they are talking to the bot: it can write to them again
+      if (arg === "on") {
+        await dms.clearBlocked(ctx.from.id).catch(error => console.error("clearing dm_blocked_at failed:", error));
+      }
+      console.log(`user ${ctx.from.id} turned price reminders ${arg}`);
+      await ctx.reply(t(lang, arg === "on" ? "remindersOn" : "notifyOff"));
+      return;
+    }
+    const doc = await users.findOne({id: ctx.from.id});
+    await ctx.reply(t(lang, doc?.notify_off_at ? "notifyStatusOff" : "notifyStatusOn"));
+  }
+
   // Command menus: English by default, Russian for Russian Telegram apps; a
-  // private chat lists /start and /help, groups list the chat commands. Runs
-  // once per bot start; a failure only leaves the old menu in place.
+  // private chat lists /start, /help and /notify, groups list the chat
+  // commands. Runs once per bot start; a failure only leaves the old menu in
+  // place.
   for (const lang of LANGUAGES) {
     // "reward" is described by the "commandReward" text
     const describe = command => ({
@@ -865,7 +910,7 @@ export default function createBot(database, token, options) {
     const chatCommands = ["verify", "jetton", "reward", "lang"].map(describe);
     const menus = [
       [chatCommands, {type: "default"}],
-      [["start", "help"].map(describe), {type: "all_private_chats"}],
+      [["start", "help", "notify"].map(describe), {type: "all_private_chats"}],
       [[...chatCommands, describe("help")], {type: "all_group_chats"}],
     ];
     for (const [commands, scope] of menus) {
@@ -894,6 +939,7 @@ export default function createBot(database, token, options) {
   telegraf.command("reward", handleReward);
   telegraf.command("lang", handleLang);
   telegraf.command(["start", "help"], handleStart);
+  telegraf.command("notify", handleNotify);
 
   // A channel post is not a `message`, so Telegraf's command middleware never
   // sees commands typed inside a channel; dispatch them here.
@@ -1533,9 +1579,19 @@ export default function createBot(database, token, options) {
     if (!key || !isPrice(params?.from) || !isPrice(params?.to)) return null;
     if (type !== "price_decrease_scheduled") return {text: t(lang, key, params), extra: {}};
     if (Number.isNaN(new Date(params.effective_at ?? NaN).getTime())) return null;
+    // members start the bot in private with one tap, and are told reminders
+    // are on (/start remind)
+    const remindUrl = `https://t.me/${telegraf.botInfo?.username || "achivator_bot"}?start=remind`;
     return {
       text: t(lang, key, params),
-      extra: {reply_markup: {inline_keyboard: [[{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}]]}},
+      extra: {
+        reply_markup: {
+          inline_keyboard: [
+            [{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}],
+            [{text: t(lang, "buttonGetReminders"), url: remindUrl}],
+          ],
+        },
+      },
     };
   }
 
@@ -1610,7 +1666,7 @@ export default function createBot(database, token, options) {
           continue;
         }
 
-        const fansOut = FAN_OUT_TYPES.has(row.type);
+        const fansOut = hasPrivateMessages(row);
         // a group that became a supergroup is posted to under its new id
         const target = (await getChatConfig(row.chat_id)).migrated_to_chat_id ?? row.chat_id;
         let posted;
@@ -1675,11 +1731,37 @@ export default function createBot(database, token, options) {
 
   // ---- Private reminders about a price decrease ----
   // When the chat hears that the price of a point will drop, every member
-  // with unclaimed points there also gets a private message (the DM queue,
-  // dm-queue.mjs): how many points they have and roughly what they are worth
-  // at the current price. When the decrease is cancelled, those who got (or
-  // were about to get) that message hear it is cancelled. The queue rows of a
-  // scheduled decrease carry its announcement's _id as `source_id`.
+  // with points that would lose value there also gets a private message (the
+  // DM queue, dm-queue.mjs). The points are split the way the mini app pays
+  // them (reminders.mjs): those claimable now must be claimed before the
+  // decrease, those maturing before it as soon as they mature; those still
+  // maturing at the decrease keep the current price anyway and are only
+  // mentioned. A member with nothing to lose gets no message. When the
+  // decrease is cancelled, or an increase cancels it, those who got (or were
+  // about to get) the reminder hear it. The queue rows of an announcement
+  // carry its _id as `source_id`.
+  //
+  // No reminder goes out for a decrease with no notice: the mini app applies
+  // it at once and queues no "will drop" announcement, only "price
+  // decreased" (as the bot does for one it applies), and a "will drop" for a
+  // moment already past is skipped (drainOutbox). There is nothing left to
+  // act on.
+  //
+  // Members choose: /notify off (users.notify_off_at) leaves them out of the
+  // fan-outs and skips their queued reminders, /notify on or the
+  // announcement's "Get reminders" deep link (/start remind) turns them back
+  // on. The first reminder a member gets says how (users.first_dm_at).
+  //
+  // Reach: the announcement row counts what became of its reminders,
+  //   reach: {queued, sent, unreachable, opted_out, failed}
+  // `queued` is the number of queue rows; `unreachable` and `opted_out`
+  // count members left out by the fan-out (dm_blocked_at, notify_off_at)
+  // plus those the queue skipped for the same reasons or got a 403 from;
+  // `failed` rows were given up. A scheduled decrease's row also gets
+  // `scheduled_by` (the pending's `by`) and `reach_due: true`; once none of
+  // its reminders is left to send, the announcements pass sends that creator
+  // a one-line summary through the queue and sets `reach_reported_at`
+  // (nothing is sent if the decrease is no longer pending).
   //
   // A sent announcement row gets `fanout_due: true` in the same write as
   // `sent_at`; queuing the messages clears it and sets `fanned_out_at`. Rows
@@ -1687,9 +1769,18 @@ export default function createBot(database, token, options) {
   // out at the start of the next pass, before the chat's later
   // announcements. Queuing twice is harmless: dm_queue is unique on
   // {source_id, user_id}.
-  const FAN_OUT_TYPES = new Set(["price_decrease_scheduled", "price_decrease_cancelled"]);
+  const REMINDER_KINDS = new Set(["price_decrease_scheduled", "price_decrease_cancelled", "price_increased"]);
+  const REACH_FIELDS = ["queued", "sent", "unreachable", "opted_out", "failed"];
   const USER_LOOKUP_CHUNK = 1000;
   const FAN_OUT_BATCH = 500;
+
+  announcements.createIndex({reach_due: 1}, {sparse: true}).catch(console.error);
+
+  // Announcements whose members hear about them in private.
+  function hasPrivateMessages(row) {
+    if (row.type === "price_decrease_scheduled" || row.type === "price_decrease_cancelled") return true;
+    return row.type === "price_increased" && Boolean(row.params?.cancelled_pending);
+  }
 
   // one 429 pause for the announcements and the private messages
   const telegramPause = createPause(database);
@@ -1698,20 +1789,36 @@ export default function createBot(database, token, options) {
     telegram: telegraf.telegram,
     render: renderDm,
     isStale: staleDm,
+    optional: row => REMINDER_KINDS.has(row.kind),
+    onOutcome: countReach,
     pause: telegramPause,
   });
 
-  function renderDm(row) {
+  const openAppButton = lang => ({
+    reply_markup: {inline_keyboard: [[{text: t(lang, "buttonOpenApp"), url: MINI_APP_URL}]]},
+  });
+
+  function renderDm(row, {firstDm = false} = {}) {
     const params = row.params;
-    if (!isPrice(params?.from)) return null;
-    if (row.kind === "price_decrease_cancelled") return {text: t(row.lang, "dmPriceDecreaseCancelled", params), extra: {}};
-    if (row.kind !== "price_decrease_scheduled") return null;
-    if (!isPrice(params.to) || !params.points || !params.estimate) return null;
-    if (Number.isNaN(new Date(params.effective_at ?? NaN).getTime())) return null;
-    return {
-      text: t(row.lang, "dmPriceDecreaseScheduled", params),
-      extra: {reply_markup: {inline_keyboard: [[{text: t(row.lang, "buttonOpenApp"), url: MINI_APP_URL}]]}},
-    };
+    if (row.kind === "reach_summary") {
+      if (Number.isNaN(new Date(params?.effective_at ?? NaN).getTime())) return null;
+      return {text: t(row.lang, "dmReachSummary", params), extra: {}};
+    }
+    if (!REMINDER_KINDS.has(row.kind) || !isPrice(params?.from)) return null;
+    let message;
+    if (row.kind === "price_decrease_cancelled") {
+      message = {text: t(row.lang, "dmPriceDecreaseCancelled", params), extra: {}};
+    } else if (row.kind === "price_increased") {
+      if (!isPrice(params.to)) return null;
+      message = {text: t(row.lang, "dmPriceIncreaseCancelsDecrease", params), extra: {}};
+    } else {
+      if (!isPrice(params.to) || !params.points || !params.estimate) return null;
+      if (Number.isNaN(new Date(params.effective_at ?? NaN).getTime())) return null;
+      message = {text: t(row.lang, "dmPriceDecreaseScheduled", params), extra: openAppButton(row.lang)};
+    }
+    // the first reminder a member ever gets says how to turn them off
+    if (!firstDm) return message;
+    return {...message, text: `${message.text}\n\n${t(row.lang, "dmNotifyHint")}`, hinted: true};
   }
 
   // The chat's point_price_pending while it is still the decrease `params`
@@ -1732,8 +1839,15 @@ export default function createBot(database, token, options) {
     return currentPending(await cache.get(row.chat_id), row.params, now) ? null : "decrease no longer pending";
   }
 
-  // user id -> {lang, blocked} for the members to write to: the language of
-  // their Telegram app as last seen, else the chat's, else English.
+  // What the queue did with a reminder, counted on its announcement.
+  async function countReach(row, outcome) {
+    if (!REMINDER_KINDS.has(row.kind) || !REACH_FIELDS.includes(outcome)) return;
+    await announcements.updateOne({_id: row.source_id}, {$inc: {[`reach.${outcome}`]: 1}});
+  }
+
+  // user id -> {lang, blocked, optedOut} for the members to write to: the
+  // language of their Telegram app as last seen, else the chat's, else
+  // English.
   async function recipientsInfo(chat_id, userIds) {
     const fallback = await chatLang(chat_id);
     const known = new Map();
@@ -1743,34 +1857,95 @@ export default function createBot(database, token, options) {
     }
     return id => {
       const doc = known.get(id);
-      return {lang: LANGUAGES.includes(doc?.lang) ? doc.lang : fallback, blocked: Boolean(doc?.dm_blocked_at)};
+      return {
+        lang: LANGUAGES.includes(doc?.lang) ? doc.lang : fallback,
+        blocked: Boolean(doc?.dm_blocked_at),
+        optedOut: Boolean(doc?.notify_off_at),
+      };
     };
   }
 
+  // Splits the members to remind into those written to and those left out:
+  // `stats` counts the left out, the rows to queue are returned.
+  function reachable(userIds, info, stats) {
+    return userIds.filter(user_id => {
+      const {blocked, optedOut} = info(user_id);
+      if (blocked) stats.unreachable++;
+      else if (optedOut) stats.opted_out++;
+      return !blocked && !optedOut;
+    });
+  }
+
+  // user id -> their lots in the chat earned after `sinceMs` ([{points, at}]),
+  // from reaction_points and grants; either may date a doc as a Date or as
+  // epoch ms, so both are asked for (the mini app's lot-dates.js).
+  async function recentLots(chat_id, userIds, sinceMs) {
+    const lots = new Map();
+    if (!Number.isFinite(sinceMs) || userIds.length === 0) return lots;
+    const sources = [
+      [reactionPoints, "receiver_id"],
+      [grants, "user_id"],
+    ];
+    for (const [collection, field] of sources) {
+      const cursor = collection.find(
+        {
+          chat_id,
+          [field]: {$in: userIds},
+          $or: [{date: {$gt: new Date(sinceMs)}}, {date: {$gt: sinceMs}}],
+        },
+        {projection: {_id: 0, [field]: 1, points: 1, date: 1}},
+      );
+      for await (const doc of cursor) {
+        const list = lots.get(doc[field]) ?? [];
+        list.push({points: doc.points, at: doc.date});
+        lots.set(doc[field], list);
+      }
+    }
+    return lots;
+  }
+
   async function fanOutScheduled(row, now) {
+    const stats = {queued: 0, unreachable: 0, opted_out: 0};
     const chat = await chats.findOne({id: row.chat_id});
     // cancelled or replaced before the members could be told (e.g. both
     // announcements were queued while the bot was down): tell nobody
-    if (!currentPending(chat, row.params, now)) return 0;
+    const pending = currentPending(chat, row.params, now);
+    if (!pending) return stats;
     if (decimalMul(1, row.params.from) === null) {
       console.error(`announcement ${row._id}: price ${row.params.from} is not a decimal, no private messages`);
-      return 0;
+      return stats;
     }
+    if (pending.by != null) stats.scheduled_by = pending.by;
+
+    const {from, to, symbol = null, effective_at} = row.params;
+    const timing = {
+      now,
+      effectiveAt: new Date(effective_at),
+      maturationDays: chatMaturationDays(chat),
+      decreaseDays: decreaseMaturationDays(pending, chat),
+    };
+    const sinceMs = timing.maturationDays || timing.decreaseDays ? lotWindowStart(timing) : NaN;
 
     // Holders are streamed FAN_OUT_BATCH at a time: a big chat's holders
-    // never sit in memory at once, and each batch costs one users lookup and
-    // one unordered insertMany (enqueue).
-    const {from, to, symbol = null, effective_at} = row.params;
-    let queued = 0;
+    // never sit in memory at once, and each batch costs one users lookup, one
+    // lots lookup per collection and one unordered insertMany (enqueue).
     async function queueBatch(docs) {
       const holders = docs
-        .map(doc => ({user_id: doc.user_id, points: decimalSub(doc.points, doc.claimed_points || 0)}))
-        .filter(holder => isPositiveDecimal(holder.points));
+        .map(doc => ({user_id: doc.user_id, unclaimed: decimalSub(doc.points, doc.claimed_points || 0)}))
+        .filter(holder => isPositiveDecimal(holder.unclaimed));
       if (holders.length === 0) return;
       const info = await recipientsInfo(row.chat_id, holders.map(holder => holder.user_id));
-      const batch = holders
-        .filter(holder => !info(holder.user_id).blocked)
-        .map(holder => ({
+      const ids = reachable(holders.map(holder => holder.user_id), info, stats);
+      const writing = new Set(ids);
+      const writeTo = holders.filter(holder => writing.has(holder.user_id));
+      const lots = await recentLots(row.chat_id, ids, sinceMs);
+      const batch = [];
+      for (const holder of writeTo) {
+        const maturing = maturingPoints(lots.get(holder.user_id), timing);
+        const split = splitUnclaimed({unclaimed: holder.unclaimed, ...maturing});
+        // all still maturing at the decrease: nothing to lose, nothing to say
+        if (!split || !isPositiveDecimal(split.atRisk)) continue;
+        batch.push({
           user_id: holder.user_id,
           chat_id: row.chat_id,
           source_id: row._id,
@@ -1781,12 +1956,17 @@ export default function createBot(database, token, options) {
             to,
             symbol,
             effective_at: new Date(effective_at),
-            points: holder.points,
-            estimate: decimalMul(holder.points, from),
+            // claimable now, and roughly their worth at the current price
+            points: split.claimable,
+            estimate: decimalMul(split.claimable, from),
+            maturing: split.maturing,
+            maturing_estimate: decimalMul(split.maturing, from),
+            protected: split.protected,
           },
           lang: info(holder.user_id).lang,
-        }));
-      queued += await dms.enqueue(batch, now);
+        });
+      }
+      stats.queued += await dms.enqueue(batch, now);
     }
 
     const cursor = rewards
@@ -1800,13 +1980,15 @@ export default function createBot(database, token, options) {
       docs = [];
     }
     await queueBatch(docs);
-    return queued;
+    return stats;
   }
 
   // Only the members who got, or are getting, the reminder of the decrease
-  // this cancels: the chat's latest "will drop" announcement before it.
+  // this cancels (a "cancelled" announcement, or an increase that replaced
+  // the decrease): the chat's latest "will drop" announcement before it.
   // Reminders still waiting in the queue are dropped instead.
   async function fanOutCancelled(row, now) {
+    const stats = {queued: 0, unreachable: 0, opted_out: 0};
     const [scheduled] = await announcements
       .find({chat_id: row.chat_id, type: "price_decrease_scheduled", created_at: {$lte: row.created_at}})
       .sort({created_at: -1})
@@ -1814,8 +1996,8 @@ export default function createBot(database, token, options) {
       .toArray();
     // never announced nor reminded (a row given up still reminds), or
     // already cancelled once: its reminders are not about this
-    if (!(scheduled?.sent_at || scheduled?.fanned_out_at) || scheduled.skipped) return 0;
-    if (scheduled.dm_cancelled_by != null && String(scheduled.dm_cancelled_by) !== String(row._id)) return 0;
+    if (!(scheduled?.sent_at || scheduled?.fanned_out_at) || scheduled.skipped) return stats;
+    if (scheduled.dm_cancelled_by != null && String(scheduled.dm_cancelled_by) !== String(row._id)) return stats;
     await announcements.updateOne({_id: scheduled._id}, {$set: {dm_cancelled_by: row._id}});
 
     await dms.collection.updateMany(
@@ -1824,7 +2006,6 @@ export default function createBot(database, token, options) {
     );
     const chat = await chats.findOne({id: row.chat_id});
     const {from, to = null, symbol = null} = row.params;
-    let queued = 0;
     async function queueBatch(dmRows) {
       const reminded = dmRows
         // delivered, or being sent right now
@@ -1832,17 +2013,15 @@ export default function createBot(database, token, options) {
         .map(dm => dm.user_id);
       if (reminded.length === 0) return;
       const info = await recipientsInfo(row.chat_id, reminded);
-      const batch = reminded
-        .filter(user_id => !info(user_id).blocked)
-        .map(user_id => ({
-          user_id,
-          chat_id: row.chat_id,
-          source_id: row._id,
-          kind: row.type,
-          params: {chat_title: chat?.title || null, from, to, symbol},
-          lang: info(user_id).lang,
-        }));
-      queued += await dms.enqueue(batch, now);
+      const batch = reachable(reminded, info, stats).map(user_id => ({
+        user_id,
+        chat_id: row.chat_id,
+        source_id: row._id,
+        kind: row.type,
+        params: {chat_title: chat?.title || null, from, to, symbol},
+        lang: info(user_id).lang,
+      }));
+      stats.queued += await dms.enqueue(batch, now);
     }
 
     // streamed like fanOutScheduled
@@ -1857,18 +2036,37 @@ export default function createBot(database, token, options) {
       dmRows = [];
     }
     await queueBatch(dmRows);
-    return queued;
+    return stats;
   }
 
   // Queues the private messages of a sent announcement and marks it done;
   // false (logged) when that failed and a later pass must retry.
   async function completeFanOut(row, now) {
     try {
-      const queued =
+      const stats =
         row.type === "price_decrease_scheduled" ? await fanOutScheduled(row, now) : await fanOutCancelled(row, now);
-      await announcements.updateOne({_id: row._id}, {$set: {fanned_out_at: now}, $unset: {fanout_due: ""}});
-      if (queued > 0) {
-        console.log(`announcement ${row._id} (${row.type}): ${queued} private messages queued`);
+      // `queued` counts the rows, so a re-run after a crash halfway through
+      // still counts the ones queued before it; those left out are counted by
+      // the first fan-out to complete only.
+      const queuedRows = await dms.collection.countDocuments({source_id: row._id});
+      const first = {fanned_out_at: now, "reach.queued": queuedRows};
+      if (stats.scheduled_by != null) Object.assign(first, {scheduled_by: stats.scheduled_by, reach_due: true});
+      await announcements.updateOne(
+        {_id: row._id, fanned_out_at: null},
+        {
+          $set: first,
+          $unset: {fanout_due: ""},
+          $inc: {
+            "reach.sent": 0,
+            "reach.unreachable": stats.unreachable,
+            "reach.opted_out": stats.opted_out,
+            "reach.failed": 0,
+          },
+        },
+      );
+      await announcements.updateOne({_id: row._id}, {$set: {"reach.queued": queuedRows}, $unset: {fanout_due: ""}});
+      if (stats.queued > 0) {
+        console.log(`announcement ${row._id} (${row.type}): ${stats.queued} private messages queued`);
         dms.wake(); // send them now, not after the queue's idle wait
       }
       return true;
@@ -1885,6 +2083,46 @@ export default function createBot(database, token, options) {
     for (const row of missed) {
       if (held.has(row.chat_id) || !(await completeFanOut(row, now))) held.add(row.chat_id);
     }
+  }
+
+  // Scheduled decreases whose reminders have all been sent (or skipped or
+  // given up): the creator who scheduled it hears how far they reached, in
+  // private, if they have started the bot (the queue skips them otherwise).
+  async function reportReach(now) {
+    let reported = 0;
+    const due = await announcements.find({reach_due: true}).sort({created_at: 1}).limit(ANNOUNCE_BATCH).toArray();
+    for (const row of due) {
+      try {
+        const open = await dms.collection.countDocuments(
+          {source_id: row._id, sent_at: null, attempts: {$not: {$gte: DM_MAX_ATTEMPTS}}},
+          {limit: 1},
+        );
+        if (open > 0) continue;
+        const chat = await chats.findOne({id: row.chat_id});
+        // cancelled, replaced or applied meanwhile: the creator knows
+        if (currentPending(chat, row.params, now) && row.scheduled_by != null) {
+          const info = await recipientsInfo(row.chat_id, [row.scheduled_by]);
+          const reach = Object.fromEntries(REACH_FIELDS.map(field => [field, row.reach?.[field] ?? 0]));
+          const params = {chat_title: chat.title || null, effective_at: new Date(row.params.effective_at), ...reach};
+          const summary = {
+            user_id: row.scheduled_by,
+            chat_id: row.chat_id,
+            // its own source: one summary per announcement, whoever runs this
+            source_id: `reach:${row._id}`,
+            kind: "reach_summary",
+            params,
+            lang: info(row.scheduled_by).lang,
+          };
+          const queued = await dms.enqueue([summary], now);
+          if (queued > 0) dms.wake();
+          reported++;
+        }
+        await announcements.updateOne({_id: row._id}, {$set: {reach_reported_at: now}, $unset: {reach_due: ""}});
+      } catch (error) {
+        console.error(`announcement ${row._id}: reporting its reach failed:`, error);
+      }
+    }
+    return reported;
   }
 
   // A scheduled decrease takes effect at `effective_at`. It is applied only if
@@ -1955,7 +2193,7 @@ export default function createBot(database, token, options) {
   // what they queued. Never rejects; resolves to what it did, for logs and
   // tests.
   async function runAnnouncements(now = new Date()) {
-    const done = {sent: 0, applied: 0, subscriptions: 0};
+    const done = {sent: 0, applied: 0, subscriptions: 0, reach: 0};
     const held = new Set();
     try {
       done.sent = await drainOutbox(now, held);
@@ -1973,6 +2211,11 @@ export default function createBot(database, token, options) {
       } catch (error) {
         console.error("announcement outbox failed:", error);
       }
+    }
+    try {
+      done.reach = await reportReach(now);
+    } catch (error) {
+      console.error("reporting reminder reach failed:", error);
     }
     // hourly: reminders are days apart
     if (now.getTime() - lastSubscriptionPass >= SUBSCRIPTION_PASS_MS) {
