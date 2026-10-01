@@ -218,8 +218,12 @@ assert.ok(achievementsOf(NEWCOMER).includes("reactive"));
 // newbie at exactly the 10th text message
 for (let i = 0; i < 9; i++) await send(user(AUTHOR), {text: `m${i}`});
 assert.ok(!achievementsOf(AUTHOR).includes("newbie"));
-await send(user(AUTHOR), {text: "tenth"});
+const tenth = await send(user(AUTHOR), {text: "tenth"});
 assert.ok(achievementsOf(AUTHOR).includes("newbie"));
+// The congratulation replies to the message that earned it, so in a channel's
+// discussion group it lands in the comment thread, not the group's main feed.
+const congrats = sent.findLast(m => m.chat_id === CHAT.id && m.text.includes("newbie"));
+assert.deepEqual(congrats.reply_parameters, {message_id: tenth, allow_sending_without_reply: true});
 
 // Pair cap: one reactor pays one receiver PAIR_DAILY_CAP (5) reactions a day.
 for (let i = 0; i < 6; i++) {
