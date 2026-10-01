@@ -418,6 +418,20 @@ assert.equal(points(IVAN.id), 4);
 await send(user(CREATOR), mentionCommand("/reward 3 за Ivan Petrov", "Ivan Petrov", IVAN));
 assert.match(lastText(CHAT.id), /^Начислить баллы участнику:/);
 assert.equal(points(IVAN.id), 4);
+// A comment under a channel post replies to its automatic forward into the
+// discussion group (sent by Telegram, 777000): a publisher bot names the
+// member in the command, and the confirmation stays in the comments.
+const PUBLISHER = {id: 65, is_bot: true, first_name: "Publisher", username: "publisher_bot"};
+statuses.set(PUBLISHER.id, "administrator");
+const FORWARD = {message_id: 900, date: 1, chat: CHAT, from: {id: 777000, is_bot: false, first_name: "Telegram"},
+  sender_chat: {id: -1009, type: "channel", title: "Memes"}, is_automatic_forward: true, photo: [{file_id: "p"}]};
+await send(PUBLISHER, {...mentionCommand("/reward Ivan Petrov 6 отличный мем!", "Ivan Petrov", IVAN), reply_to_message: FORWARD});
+assert.equal(lastText(CHAT.id), "Ivan: +6 баллов — отличный мем!\nИх можно будет забрать жетонами в мини-приложении, когда пройдёт срок созревания.");
+assert.equal(sent.at(-1).reply_to_message_id, FORWARD.message_id);
+assert.deepEqual([points(IVAN.id), points(777000)], [10, 0]);
+await send(PUBLISHER, {...command("/reward @MemeLord 1"), reply_to_message: FORWARD});
+assert.equal(points(63), 3);
+statuses.delete(PUBLISHER.id);
 statuses.delete(CREATOR);
 
 // Private chats follow the user's Telegram app.

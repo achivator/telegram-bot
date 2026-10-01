@@ -526,7 +526,12 @@ export default function createBot(database, token, options) {
     const msg = ctx.message || ctx.channelPost;
     const text = msg.text || "";
     const tokens = text.split(/\s+/).slice(1).filter(Boolean);
-    const replyTo = msg.reply_to_message;
+    // A comment under a channel post replies to the post's automatic forward
+    // into the discussion group, whose sender is Telegram itself: the target
+    // comes from the command, as without a reply (a publisher bot names the
+    // member who sent the meme). The confirmation still goes into the comments.
+    const thread = msg.reply_to_message;
+    const replyTo = thread?.is_automatic_forward ? null : thread;
     // A mention of a member without a username arrives as a text_mention
     // entity that carries the user; its text is their name, spaces and all.
     const firstArg = text.match(/^\S*\s*/)[0].length;
@@ -591,7 +596,7 @@ export default function createBot(database, token, options) {
     );
 
     await ctx.reply(t(lang, "rewardGranted", grant.points, target.name, grant.reason), {
-      reply_to_message_id: replyTo?.message_id,
+      reply_to_message_id: thread?.message_id,
     });
   }
 
