@@ -1037,7 +1037,8 @@ export default function createBot(database, token, options) {
   //     the bot and the mini app store (settings, prices, rewards, grants,
   //     paid reactions, statistics, achievements, payments, the outbox and
   //     the private message rows), the id the chat's TON pool is derived
-  //     from on-chain (ChatPool(master, chatId, key)) and its vouchers carry.
+  //     from on-chain (ChatPool(master, chatId); pools of v2 masters also
+  //     hashed the backend key in) and its vouchers carry.
   //     The pool knows nothing about Telegram: nothing moves on-chain.
   //   - its telegram id, the NEW one: where the bot posts and where the bot
   //     and the mini app check membership and admin rights.
